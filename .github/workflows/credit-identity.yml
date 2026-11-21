@@ -2,20 +2,25 @@ name: Credit identity
 
 on:
   pull_request_target:
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
+  checks: write
 
 jobs:
   credit-identity:
-    name: Exact author, committer and credit messages
+    name: Trusted base credit audit publisher
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Inspect exact PR objects with trusted base validator
+      - name: Inspect exact PR objects and publish head-bound result
+        env:
+          CREDIT_CHECK_TOKEN: ${{ github.token }}
         shell: python
         run: |
+          import hashlib
           import json
           import os
           import pathlib
@@ -23,38 +28,207 @@ jobs:
           import subprocess
           import sys
           import tempfile
-
+          
+          
           def require(value, reason):
               if not value:
-                  raise SystemExit('CREDIT CI FAILED CLOSED: ' + reason)
-
-          require(os.environ['GITHUB_EVENT_NAME'] == 'pull_request_target', 'wrong event')
-          event = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_text())
-          pr = event['pull_request']
-          repo = os.environ['GITHUB_REPOSITORY']
-          require(re.fullmatch(r'soliskit/[A-Za-z0-9_.-]+', repo), 'unexpected repository')
-          require(pr['base']['repo']['full_name'] == repo, 'wrong base repository')
-          number = event['number']
-          require(type(number) is int and number > 0, 'invalid PR number')
-          base = pr['base']['sha']
-          head = pr['head']['sha']
-          require(all(re.fullmatch(r'[0-9a-f]{40}', x) for x in (base, head)), 'invalid exact SHA')
-          env = {k:v for k,v in os.environ.items() if not k.startswith('GIT_')}
-          env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null', GIT_TERMINAL_PROMPT='0')
-          env.pop('GITHUB_TOKEN', None)
-          env.pop('GH_TOKEN', None)
-          with tempfile.TemporaryDirectory() as work:
-              def git(*args):
-                  subprocess.run(['/usr/bin/git', '-C', work, *args], check=True, env=env, timeout=120)
-              git('init', '--quiet')
-              git('remote', 'add', 'origin', 'https://github.com/' + repo + '.git')
-              git('fetch', '--no-tags', 'origin', base, 'refs/pull/' + str(number) + '/head:refs/inspection/head')
-              actual = subprocess.check_output(['/usr/bin/git', '-C', work, 'rev-parse', 'refs/inspection/head'], env=env, timeout=10).decode().strip()
-              require(actual == head, 'PR head moved; rerun on current event, do not inspect wrong head')
-              probe = subprocess.run(['/usr/bin/git', '-C', work, 'cat-file', '-e', base + ':.credit-guard/strict_guard.py'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
-              require(probe.returncode == 0, 'trusted base has no installed validator; bootstrap required')
-              git('checkout', base, '--', '.credit-guard')
-              trusted = pathlib.Path(work) / '.credit-guard'
-              require(trusted.is_dir(), 'trusted base has no installed validator')
-              print('CREDIT CI: trusted source base=' + base + ' proposed head=' + head + ' repo=' + repo, flush=True)
-              subprocess.run([sys.executable, str(trusted / 'strict_guard.py'), '--repo', work, '--tip', head], check=True, env=env, timeout=420)
+                  raise ValueError("CREDIT CI FAILED CLOSED: " + reason)
+          
+          
+          require(os.environ["GITHUB_EVENT_NAME"] == "pull_request_target", "wrong event")
+          event = json.loads(pathlib.Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+          pr = event["pull_request"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          require(re.fullmatch(r"soliskit/[A-Za-z0-9_.-]+", repo), "unexpected repository")
+          require(repo == "soliskit/tetris-js-clean", "wrong repository")
+          require(
+              pr["base"]["repo"]["full_name"] == repo and pr["base"]["ref"] == "main",
+              "wrong base",
+          )
+          require(pr["head"]["repo"]["full_name"] == repo, "same-repository qualification only")
+          number = event["number"]
+          require(type(number) is int and number > 0, "invalid PR number")
+          base = pr["base"]["sha"]
+          head = pr["head"]["sha"]
+          require(
+              all(re.fullmatch(r"[0-9a-f]{40}", x) for x in (base, head)), "invalid exact SHA"
+          )
+          PINS = {
+              "strict_guard.py": "5a48c2a4ab0afacd7ff4fd7a7d722ed30a5d794e42f014ef0ee7ba3c0851e5db",
+              "publication_gate.py": "d5c779c572a54dfe5f4ce71c47413d29fe46cc9c0acc2709a60d145722fcf68b",
+              "denied.json": "a0ebdc174a661c2b456f669d99155b398c3ce71fa355819d978c65e3fa83cd0c",
+              "hook_entry.py": "2be14befd655581f2f1c8d864c2d10d6633385b0d28c74d1f1a68739c6b42316",
+          }
+          
+          import time
+          import urllib.request
+          
+          CHECK_NAME = "Credit exact head v1"
+          API = "https://api.github.com/repos/soliskit/tetris-js-clean/check-runs"
+          
+          
+          def api(method, suffix, payload):
+              request = urllib.request.Request(
+                  API + suffix,
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "Authorization": "Bearer " + os.environ["CREDIT_CHECK_TOKEN"],
+                      "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json",
+                      "X-GitHub-Api-Version": "2026-03-10",
+                  },
+                  method=method,
+              )
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  return json.load(response)
+          
+          
+          check = api("POST", "", {"name": CHECK_NAME, "head_sha": head, "status": "in_progress"})
+          require(
+              type(check["id"]) is int
+              and check["head_sha"] == head
+              and check["app"]["id"] == 15368,
+              "unexpected check identity",
+          )
+          check_id = check["id"]
+          
+          
+          def finish(conclusion):
+              response = api(
+                  "PATCH",
+                  "/" + str(check_id),
+                  {
+                      "status": "completed",
+                      "conclusion": conclusion,
+                      "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      "output": {
+                          "title": "Exact-head credit audit",
+                          "summary": "head=" + head + " base=" + base,
+                      },
+                  },
+              )
+              require(
+                  response["head_sha"] == head
+                  and response["app"]["id"] == 15368
+                  and response["conclusion"] == conclusion,
+                  "check update mismatch",
+              )
+          
+          
+          try:
+              env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+              env.update(
+                  GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_TERMINAL_PROMPT="0"
+              )
+              env.pop("GITHUB_TOKEN", None)
+              env.pop("GH_TOKEN", None)
+              env.pop("CREDIT_CHECK_TOKEN", None)
+              with tempfile.TemporaryDirectory() as work:
+          
+                  def git(*args):
+                      subprocess.run(
+                          ["/usr/bin/git", "-C", work, *args], check=True, env=env, timeout=120
+                      )
+          
+                  git("init", "--quiet")
+                  git("remote", "add", "origin", "https://github.com/" + repo + ".git")
+                  git(
+                      "fetch",
+                      "--no-tags",
+                      "origin",
+                      base,
+                      "refs/pull/" + str(number) + "/head:refs/inspection/head",
+                  )
+                  actual = (
+                      subprocess.check_output(
+                          ["/usr/bin/git", "-C", work, "rev-parse", "refs/inspection/head"],
+                          env=env,
+                          timeout=10,
+                      )
+                      .decode()
+                      .strip()
+                  )
+                  require(
+                      actual == head,
+                      "PR head moved; rerun on current event, do not inspect wrong head",
+                  )
+                  probe = subprocess.run(
+                      [
+                          "/usr/bin/git",
+                          "-C",
+                          work,
+                          "cat-file",
+                          "-e",
+                          base + ":.credit-guard/strict_guard.py",
+                      ],
+                      env=env,
+                      check=False,
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.PIPE,
+                      timeout=10,
+                  )
+                  require(
+                      probe.returncode == 0,
+                      "trusted base has no installed validator; bootstrap required",
+                  )
+                  for name, expected in PINS.items():
+                      for sha in (base, head):
+                          raw = subprocess.check_output(
+                              [
+                                  "/usr/bin/git",
+                                  "-C",
+                                  work,
+                                  "show",
+                                  sha + ":.credit-guard/" + name,
+                              ],
+                              env=env,
+                              timeout=10,
+                          )
+                          require(
+                              hashlib.sha256(raw).hexdigest() == expected,
+                              "guard pin changed: " + name,
+                          )
+                  base_workflows = subprocess.check_output(
+                      ["/usr/bin/git", "-C", work, "rev-parse", base + ":.github/workflows"],
+                      env=env,
+                      timeout=10,
+                  )
+                  head_workflows = subprocess.check_output(
+                      ["/usr/bin/git", "-C", work, "rev-parse", head + ":.github/workflows"],
+                      env=env,
+                      timeout=10,
+                  )
+                  require(
+                      base_workflows == head_workflows,
+                      "workflow changes require separate trusted bootstrap review",
+                  )
+                  git("checkout", base, "--", ".credit-guard")
+                  trusted = pathlib.Path(work) / ".credit-guard"
+                  require(trusted.is_dir(), "trusted base has no installed validator")
+                  print(
+                      "CREDIT CI: trusted source base="
+                      + base
+                      + " proposed head="
+                      + head
+                      + " repo="
+                      + repo,
+                      flush=True,
+                  )
+                  subprocess.run(
+                      [
+                          sys.executable,
+                          str(trusted / "strict_guard.py"),
+                          "--repo",
+                          work,
+                          "--tip",
+                          head,
+                      ],
+                      check=True,
+                      env=env,
+                      timeout=420,
+                  )
+          except Exception:
+              finish("failure")
+              raise
+          else:
+              finish("success")
