@@ -1,0 +1,15 @@
+node_modules/
+test-results/
+playwright-report/
+.npm
+.DS_Store
+coverage/
+reports/
+.stryker-tmp/
+dist/
+.release-evidence/
+bundle.js
+bundle.js.map
+__pycache__/
+*.pyc
+

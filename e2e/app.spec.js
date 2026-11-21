@@ -1,0 +1,922 @@
+import { test, expect } from './fixtures.js';
+import { jsonObject, present } from '../test/json.js';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { serveDirectory } from './static-server.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  PieceColors,
+  boardCells,
+  continueSavedGame,
+  expectLabel,
+  fakeWakeLock,
+  filledCount,
+  isChromium,
+  savedGame,
+  trackErrors,
+  wakeLockCounts,
+  wakeLockRequests
+} from './helpers.js';
+
+test('nothing is redrawn while the game is paused [DSP-3]', async ({
+  page
+}) => {
+  await page.addInitScript(() => {
+    window.drawCalls = 0;
+    /** @type {unknown} */
+    const fill = Reflect.get(CanvasRenderingContext2D.prototype, 'fill');
+    if (typeof fill !== 'function')
+      throw new Error('app: fill is not a function');
+    Reflect.set(
+      CanvasRenderingContext2D.prototype,
+      'fill',
+      /** @this {CanvasRenderingContext2D} */
+      function (/** @type {unknown[]} */ ...args) {
+        window.drawCalls = (window.drawCalls ?? 0) + 1;
+        Reflect.apply(fill, this, args);
+      }
+    );
+  });
+  await page.goto('/');
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('KeyP');
+  await expectLabel(page, 'Resume');
+  const before = await page.evaluate(() => window.drawCalls);
+  await page.waitForTimeout(1000);
+  expect(await page.evaluate(() => window.drawCalls)).toBe(before);
+});
+
+test('turning the square piece does not redraw it [PCE-4] [DSP-3]', async ({
+  page
+}) => {
+  await page.addInitScript(() => {
+    window.drawCalls = 0;
+    /** @type {unknown} */
+    const fill = Reflect.get(CanvasRenderingContext2D.prototype, 'fill');
+    if (typeof fill !== 'function')
+      throw new Error('app: fill is not a function');
+    Reflect.set(
+      CanvasRenderingContext2D.prototype,
+      'fill',
+      /** @this {CanvasRenderingContext2D} */
+      function (/** @type {unknown[]} */ ...args) {
+        window.drawCalls = (window.drawCalls ?? 0) + 1;
+        Reflect.apply(fill, this, args);
+      }
+    );
+  });
+  await continueSavedGame(
+    page,
+    savedGame({ piece: PieceColors.yellow, position: { row: 5, column: 4 } })
+  );
+  await page.keyboard.press('KeyP');
+  await expectLabel(page, 'Pause');
+  // Wait for gravity to move the piece once, so the live game has drawn.
+  const continued = present(await page.evaluate(() => window.drawCalls));
+  await page.waitForFunction(
+    (count) => (window.drawCalls ?? 0) > count,
+    continued
+  );
+  const before = await page.evaluate(() => window.drawCalls);
+  await page.keyboard.press('KeyW');
+  await page.keyboard.press('KeyZ');
+  // Two animation frames pass; a turn that changes nothing draws nothing.
+  await page.evaluate(
+    () =>
+      new Promise((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(resolve))
+      )
+  );
+  expect(await page.evaluate(() => window.drawCalls)).toBe(before);
+});
+
+test('the page does not wake up every frame while nothing changes [DSP-3]', async ({
+  page
+}) => {
+  await page.addInitScript(() => {
+    window.frameRequests = 0;
+    const request = window.requestAnimationFrame.bind(window);
+    window.requestAnimationFrame = (callback) => {
+      window.frameRequests = (window.frameRequests ?? 0) + 1;
+      return request(callback);
+    };
+  });
+  await page.goto('/');
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('KeyP');
+  await expectLabel(page, 'Resume');
+  await page.waitForTimeout(100);
+  const before = await page.evaluate(() => window.frameRequests);
+  await page.waitForTimeout(1000);
+  expect(await page.evaluate(() => window.frameRequests)).toBe(before);
+});
+
+test('the board is redrawn at the new size after a resize [DSP-2]', async ({
+  page
+}) => {
+  await page.goto('/');
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('KeyP');
+  const size = present(page.viewportSize());
+  await page.setViewportSize({
+    width: size.width - 40,
+    height: size.height - 120
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const canvas = document.getElementById('tetris');
+        if (!(canvas instanceof HTMLCanvasElement))
+          throw new Error('app: #tetris is not a canvas');
+        return (
+          canvas.width ===
+          Math.round(canvas.getBoundingClientRect().width * devicePixelRatio)
+        );
+      })
+    )
+    .toBe(true);
+  expect(await filledCount(page)).toBe(4);
+});
+
+test('the canvases are rebuilt when the screen pixel density changes [DSP-2]', async ({
+  page
+}) => {
+  // The page watches the density with a resolution media query. Chromium 153
+  // no longer fires its change event when DevTools emulation changes the
+  // density, so the change is stood in for: the density reads 2, and the
+  // page's own query reports the change, as a browser does when the window
+  // moves to another screen.
+  await page.addInitScript(() => {
+    const matchMedia = window.matchMedia.bind(window);
+    /** @type {MediaQueryList[]} */
+    const queries = [];
+    window.resolutionQueries = queries;
+    window.matchMedia = (query) => {
+      const list = matchMedia(query);
+      if (query.startsWith('(resolution')) queries.push(list);
+      return list;
+    };
+  });
+  await page.goto('/');
+  await page.keyboard.press('Enter');
+  await expect.poll(() => filledCount(page)).toBe(4);
+  await page.evaluate(() => {
+    window.devicePixelRatio = 2;
+    const list = window.resolutionQueries?.at(-1);
+    if (!list) throw new Error('app: no resolution query was recorded');
+    list.dispatchEvent(new Event('change'));
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const canvas = document.getElementById('tetris');
+        if (!(canvas instanceof HTMLCanvasElement))
+          throw new Error('app: #tetris is not a canvas');
+        return (
+          canvas.width === Math.round(canvas.getBoundingClientRect().width * 2)
+        );
+      })
+    )
+    .toBe(true);
+  await expect.poll(() => filledCount(page)).toBe(4);
+  // It keeps watching, now for a change away from the new density.
+  expect(
+    await page.evaluate(() => window.resolutionQueries?.at(-1)?.media)
+  ).toBe('(resolution: 2dppx)');
+});
+
+test('the page cannot be zoomed, scrolled by touch or text selected [DSP-4]', async ({
+  page
+}) => {
+  await page.goto('/');
+  const styles = await page.evaluate(() => {
+    const html = getComputedStyle(document.documentElement);
+    // The prefixed name is read by key: only WebKit reports it.
+    const read = (/** @type {string} */ key) => {
+      /** @type {unknown} */
+      const value = Reflect.get(html, key);
+      return value;
+    };
+    const gesture = new Event('gesturestart', { cancelable: true });
+    document.dispatchEvent(gesture);
+    // WebKit only reports the prefixed property.
+    return {
+      touchAction: html.touchAction,
+      userSelect: read('userSelect') ?? read('webkitUserSelect'),
+      pinchCancelled: gesture.defaultPrevented
+    };
+  });
+  expect(styles).toEqual({
+    touchAction: 'none',
+    userSelect: 'none',
+    pinchCancelled: true
+  });
+});
+
+test('the game can be installed as an app [APP-1]', async ({ page }) => {
+  test.skip(
+    !isChromium(page),
+    'Safari has no install check to query; the manifest and icons are checked by the unit tests'
+  );
+  await page.goto('/');
+  const cdp = await page.context().newCDPSession(page);
+  const manifest = await cdp.send('Page.getAppManifest');
+  expect(manifest.errors).toEqual([]);
+  const { installabilityErrors } = await cdp.send(
+    'Page.getInstallabilityErrors'
+  );
+  expect(installabilityErrors).toEqual([]);
+});
+
+// Truly offline: the test starts its own server and shuts it down. (Playwright's
+// simulated offline mode does not pass through the service worker in WebKit.)
+test('the game works offline after the first visit [APP-2]', async ({
+  page
+}, testInfo) => {
+  const port = 4300 + testInfo.workerIndex * 10 + testInfo.repeatEachIndex;
+  const server = spawn(
+    process.execPath,
+    [fileURLToPath(new URL('../index.js', import.meta.url))],
+    { env: { ...process.env, PORT: String(port) } }
+  );
+  try {
+    await new Promise((resolve) => server.stdout.once('data', resolve));
+    await page.goto(`http://localhost:${String(port)}/`);
+    await page.evaluate(() => navigator.serviceWorker.ready);
+    await page.reload();
+    await expect
+      .poll(() => page.evaluate(() => !!navigator.serviceWorker.controller))
+      .toBe(true);
+  } finally {
+    server.kill();
+  }
+  await new Promise((resolve) => server.once('exit', resolve));
+  await page.reload();
+  await expect(page.locator('#newGameButton')).toBeVisible();
+  await page.keyboard.press('Enter');
+  await expectLabel(page, 'Pause');
+  await expect.poll(() => filledCount(page)).toBe(4);
+});
+
+/** @param {import('node:http').Server} server */
+function portOf(server) {
+  const address = server.address();
+  if (address === null || typeof address === 'string')
+    throw new Error('app: the server has no port');
+  return address.port;
+}
+
+// The page in the newest version the service worker has downloaded in full.
+/** @param {import('@playwright/test').Page} page */
+function newestCachedPage(page) {
+  return page.evaluate(async () => {
+    const prefix = 'tetris-version-';
+    const number = (/** @type {string} */ name) =>
+      parseInt(name.slice(prefix.length), 10);
+    const names = (await caches.keys())
+      .filter((name) => name.startsWith(prefix))
+      .sort((a, b) => number(b) - number(a));
+    for (const name of names) {
+      const cached = await (await caches.open(name)).match('./');
+      if (cached) return cached.text();
+    }
+    return '';
+  });
+}
+
+// Serves a copy of the game the test can change, like a new deploy.
+test('after the first visit the game opens from the cache, and a new version arrives on the next launch [APP-2]', async ({
+  page
+}) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tetris-'));
+  fs.cpSync(fileURLToPath(new URL('../public', import.meta.url)), dir, {
+    recursive: true
+  });
+  const server = await serveDirectory(dir);
+  try {
+    await page.goto(`http://localhost:${String(portOf(server))}/`);
+    await page.evaluate(() => navigator.serviceWorker.ready);
+    await page.reload();
+    await expect
+      .poll(() => page.evaluate(() => !!navigator.serviceWorker.controller))
+      .toBe(true);
+    const index = path.join(dir, 'index.html');
+    fs.writeFileSync(
+      index,
+      fs
+        .readFileSync(index, 'utf8')
+        .replace('<title>Tetris</title>', '<title>Tetris Deploy 2</title>')
+    );
+    await page.reload();
+    await expect(page).toHaveTitle('Tetris');
+    await expect.poll(() => newestCachedPage(page)).toContain('Deploy 2');
+    await page.reload();
+    await expect(page).toHaveTitle('Tetris Deploy 2');
+  } finally {
+    server.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The two obsolete fixed names are preserved, never used as game sources.
+test('obsolete fixed-name caches stay while the controlled page uses its complete snapshot [APP-6] [APP-2]', async ({
+  page,
+  context
+}) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tetris-legacy-'));
+  fs.cpSync(fileURLToPath(new URL('../public', import.meta.url)), dir, {
+    recursive: true
+  });
+  const marker = 'current-snapshot-not-legacy';
+  const index = path.join(dir, 'index.html');
+  const script = path.join(dir, 'script.js');
+  fs.writeFileSync(
+    index,
+    fs
+      .readFileSync(index, 'utf8')
+      .replace('<title>Tetris</title>', `<title>Tetris ${marker}</title>`)
+  );
+  fs.appendFileSync(
+    script,
+    `\nglobalThis.cacheSourceMarker = ${JSON.stringify(marker)};\n`
+  );
+  const expectedHtml = fs.readFileSync(index, 'utf8');
+  const expectedScript = fs.readFileSync(script, 'utf8');
+  const server = await serveDirectory(dir);
+  const url = `http://localhost:${String(portOf(server))}/`;
+  try {
+    // This setup document registers the actual worker but never opens a game
+    // navigation, so no setup-page version pin may exist before the check.
+    await page.goto(`${url}icons/icon.svg`);
+    await page.evaluate(async () => {
+      for (const name of ['tetris', 'tetris-2']) {
+        const cache = await caches.open(name);
+        await cache.put(
+          new URL('/', location.href),
+          new Response(`<title>Legacy ${name}</title>`, {
+            headers: { 'Content-Type': 'text/html' }
+          })
+        );
+        await cache.put(
+          new URL('/script.js', location.href),
+          new Response(`globalThis.cacheSourceMarker = 'legacy-${name}';`, {
+            headers: { 'Content-Type': 'text/javascript' }
+          })
+        );
+      }
+    });
+    const legacyBodies = () =>
+      page.evaluate(async () =>
+        Promise.all(
+          ['tetris', 'tetris-2'].map(async (name) => {
+            const cache = await caches.open(name);
+            return {
+              name,
+              entries: await Promise.all(
+                (await cache.keys()).map(async (request) => [
+                  request.url,
+                  await (
+                    await (async () => {
+                      const hit = await cache.match(request);
+                      if (!hit) throw new Error('app: cache entry missing');
+                      return hit;
+                    })()
+                  ).text()
+                ])
+              )
+            };
+          })
+        )
+      );
+    const seeded = await legacyBodies();
+    expect(seeded.map((cache) => cache.entries.length)).toEqual([2, 2]);
+    await page.evaluate(() => navigator.serviceWorker.register('/sw.js'));
+    await page.evaluate(() => navigator.serviceWorker.ready);
+    await expect
+      .poll(() => page.evaluate(() => !!navigator.serviceWorker.controller))
+      .toBe(true);
+    expect(await legacyBodies()).toEqual(seeded);
+    const snapshot = await page.evaluate(async () => {
+      const names = (await caches.keys()).filter((name) =>
+        name.startsWith('tetris-version-')
+      );
+      if (names.length !== 1)
+        throw new Error('Expected exactly one installed snapshot');
+      const cache = await caches.open(names[0]);
+      const pins = await caches.open('tetris-pins');
+      if ((await pins.keys()).length !== 0)
+        throw new Error('Setup page must not have a game navigation pin');
+      return {
+        name: names[0],
+        html: await (
+          await (async () => {
+            const hit = await cache.match(new URL('/', location.href));
+            if (!hit) throw new Error('app: cache entry missing');
+            return hit;
+          })()
+        ).text(),
+        script: await (
+          await (async () => {
+            const hit = await cache.match(new URL('/script.js', location.href));
+            if (!hit) throw new Error('app: cache entry missing');
+            return hit;
+          })()
+        ).text()
+      };
+    });
+    expect(snapshot.html).toBe(expectedHtml);
+    expect(snapshot.script).toBe(expectedScript);
+    // Offline is the normal fetch-failure path, not a stub of activation or
+    // worker fetch logic. It also prevents a background refresh replacing the
+    // installed snapshot while this one controlled navigation is observed.
+    await context.setOffline(true);
+    const gamePage = await context.newPage();
+    const htmlResponse = present(await gamePage.goto(url));
+    expect(await htmlResponse.text()).toBe(snapshot.html);
+    await expect
+      .poll(() =>
+        gamePage.evaluate(() => {
+          /** @type {unknown} */
+          const value = Reflect.get(globalThis, 'cacheSourceMarker');
+          return value;
+        })
+      )
+      .toBe(marker);
+    await expect(gamePage).toHaveTitle(`Tetris ${marker}`);
+    const scriptBody = await gamePage.evaluate(async () =>
+      (await fetch('script.js')).text()
+    );
+    expect(scriptBody).toBe(snapshot.script);
+    const pins = await gamePage.evaluate(async () => {
+      const cache = await caches.open('tetris-pins');
+      return Promise.all(
+        (await cache.keys()).map(async (request) => {
+          const hit = await cache.match(request);
+          if (!hit) throw new Error('app: cache entry missing');
+          /** @type {unknown} */
+          const note = await hit.json();
+          return { key: request.url, note };
+        })
+      );
+    });
+    // Zero pins before this sole controlled game navigation, exactly one
+    // afterward: this is its pin, not a setup-page record chosen by value.
+    expect(pins).toHaveLength(1);
+    expect(jsonObject(present(pins[0]).note).version).toBe(snapshot.name);
+    expect(await legacyBodies()).toEqual(seeded);
+    await gamePage.keyboard.press('Enter');
+    await expect.poll(() => filledCount(gamePage)).toBe(4);
+    await gamePage.close();
+  } finally {
+    await context.setOffline(false);
+    server.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// GitHub Pages serves every project of an account from one origin, so other
+// projects' caches sit next to the game's.
+test('caches of other projects on the same origin are left alone [APP-6]', async ({
+  page
+}) => {
+  // Set up from a page that does not start the service worker.
+  await page.goto('/icons/icon.svg');
+  await page.evaluate(async () => {
+    const other = await caches.open('other-project');
+    await other.put('/other-project/', new Response('Other project'));
+  });
+  await page.goto('/');
+  // Wait for the current worker to control the page.
+  await expect
+    .poll(() => page.evaluate(() => !!navigator.serviceWorker.controller))
+    .toBe(true);
+  // The worker deletes whole caches, so the cache still being there is what
+  // counts. Its entry is not read back: WebKit's test browser returns nothing
+  // for it once the setup page has gone, though the cache itself survives.
+  expect(
+    await page.evaluate(async () =>
+      (await caches.keys()).includes('other-project')
+    )
+  ).toBe(true);
+});
+
+// A deploy caught half uploaded, or a connection lost partway through the
+// download: the cache must keep the old version whole, never a mix.
+test('a new version that cannot be downloaded in full leaves the cached game whole [APP-2]', async ({
+  page
+}) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tetris-'));
+  fs.cpSync(fileURLToPath(new URL('../public', import.meta.url)), dir, {
+    recursive: true
+  });
+  /** @type {string[]} */
+  const requested = [];
+  const server = await serveDirectory(dir, (pathname) => {
+    requested.push(pathname);
+  });
+  const cachedPage = () => newestCachedPage(page);
+  try {
+    await page.goto(`http://localhost:${String(portOf(server))}/`);
+    await page.evaluate(() => navigator.serviceWorker.ready);
+    await page.reload();
+    await expect
+      .poll(() => page.evaluate(() => !!navigator.serviceWorker.controller))
+      .toBe(true);
+    const index = path.join(dir, 'index.html');
+    fs.writeFileSync(
+      index,
+      fs
+        .readFileSync(index, 'utf8')
+        .replace('<title>Tetris</title>', '<title>Tetris Deploy 2</title>')
+    );
+    const module = path.join(dir, 'game/position.js');
+    const moduleSource = fs.readFileSync(module);
+    fs.rmSync(module);
+    requested.length = 0;
+    await page.reload();
+    await expect(page).toHaveTitle('Tetris');
+    await expect.poll(() => requested.includes('/game/position.js')).toBe(true);
+    await page.waitForTimeout(500);
+    expect(await cachedPage()).not.toContain('Deploy 2');
+    // Once every file downloads again, the new version arrives whole.
+    fs.writeFileSync(module, moduleSource);
+    await page.reload();
+    await expect.poll(cachedPage).toContain('Deploy 2');
+    await page.reload();
+    await expect(page).toHaveTitle('Tetris Deploy 2');
+    await page.keyboard.press('Enter');
+    await expect.poll(() => filledCount(page)).toBe(4);
+  } finally {
+    server.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The page here asks for its scripts only when the test says so, so a newer
+// version can finish downloading while the page is still loading. The
+// version number is in the page title and in one of the game modules.
+const deferredBootstrapTest = test.extend({ waitForGameBootstrap: false });
+
+deferredBootstrapTest(
+  'a page loads every file from the version it opened with, even if a newer one finishes downloading meanwhile [APP-2]',
+  async ({ page }) => {
+    const publicDir = fileURLToPath(new URL('../public', import.meta.url));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tetris-'));
+    fs.cpSync(publicDir, dir, { recursive: true });
+    const loader = `<script>
+    window.loadScripts = () => new Promise((resolve, reject) => {
+      const script = Object.assign(document.createElement('script'), { type: 'module', src: 'script.js', onload: resolve, onerror: reject });
+      document.body.append(script);
+    });
+  </script>`;
+    const html = fs
+      .readFileSync(path.join(publicDir, 'index.html'), 'utf8')
+      .replace(/ *<link rel="modulepreload"[^>]*>\n/g, '')
+      .replace('<script type="module" src="script.js"></script>', loader);
+    const moduleSource = fs.readFileSync(
+      path.join(publicDir, 'game/position.js'),
+      'utf8'
+    );
+    const deploy = (/** @type {number} */ version) => {
+      fs.writeFileSync(
+        path.join(dir, 'index.html'),
+        html.replace(
+          '<title>Tetris</title>',
+          `<title>Tetris ${String(version)}</title>`
+        )
+      );
+      fs.writeFileSync(
+        path.join(dir, 'game/position.js'),
+        `${moduleSource}\nglobalThis.moduleVersion = ${String(version)};\n`
+      );
+    };
+    deploy(1);
+    const server = await serveDirectory(dir);
+    try {
+      await page.goto(`http://localhost:${String(portOf(server))}/`);
+      await page.evaluate(() => {
+        const run = window.loadScripts;
+        if (!run) throw new Error('app: loadScripts was not installed');
+        return run();
+      });
+      await expect(page.locator('html')).toHaveAttribute(
+        'data-tab-admission',
+        'ready'
+      );
+      await page.evaluate(() => navigator.serviceWorker.ready);
+      deploy(2);
+      await page.reload();
+      await expect(page).toHaveTitle('Tetris 1');
+      await expect.poll(() => newestCachedPage(page)).toContain('Tetris 2');
+      await page.evaluate(() => {
+        const run = window.loadScripts;
+        if (!run) throw new Error('app: loadScripts was not installed');
+        return run();
+      });
+      await expect(page.locator('html')).toHaveAttribute(
+        'data-tab-admission',
+        'ready'
+      );
+      expect(
+        await page.evaluate(() => {
+          /** @type {unknown} */
+          const value = Reflect.get(globalThis, 'moduleVersion');
+          return value;
+        })
+      ).toBe(1);
+      await page.reload();
+      await expect(page).toHaveTitle('Tetris 2');
+      await page.evaluate(() => {
+        const run = window.loadScripts;
+        if (!run) throw new Error('app: loadScripts was not installed');
+        return run();
+      });
+      await expect(page.locator('html')).toHaveAttribute(
+        'data-tab-admission',
+        'ready'
+      );
+      expect(
+        await page.evaluate(() => {
+          /** @type {unknown} */
+          const value = Reflect.get(globalThis, 'moduleVersion');
+          return value;
+        })
+      ).toBe(2);
+    } finally {
+      server.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+);
+
+// The color space each canvas draws in, and whether this browser has Display P3 canvases at all.
+/** @param {import('@playwright/test').Page} page */
+function colorSpaces(page) {
+  return page.evaluate(() => {
+    // Browsers with only sRGB canvases may not report a color space at all.
+    const space = (/** @type {CanvasRenderingContext2D | null} */ context) => {
+      if (!context) throw new Error('app: the canvas has no 2d context');
+      /** @type {unknown} */
+      const reported = Reflect.get(
+        context.getImageData(0, 0, 1, 1),
+        'colorSpace'
+      );
+      return reported ?? 'srgb';
+    };
+    return {
+      canvases: [...document.querySelectorAll('canvas')].map((canvas) =>
+        space(canvas.getContext('2d'))
+      ),
+      supported:
+        space(
+          document
+            .createElement('canvas')
+            .getContext('2d', { colorSpace: 'display-p3' })
+        ) === 'display-p3'
+    };
+  });
+}
+
+// The first piece pixel on the board, read in the canvas color space and in sRGB.
+/** @param {import('@playwright/test').Page} page */
+function firstPiecePixel(page) {
+  return page.evaluate(() => {
+    const canvas = document.getElementById('tetris');
+    if (!(canvas instanceof HTMLCanvasElement))
+      throw new Error('app: #tetris is not a canvas');
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('app: the canvas has no 2d context');
+    const size = canvas.width / 10;
+    for (let row = 0; row < 20; row++)
+      for (let column = 0; column < 10; column++) {
+        const x = Math.floor((column + 0.5) * size);
+        const y = Math.floor((row + 0.5) * size);
+        const own = [...context.getImageData(x, y, 1, 1).data];
+        if ((own[3] ?? 0) > 200)
+          return {
+            own,
+            srgb: [
+              ...context.getImageData(x, y, 1, 1, { colorSpace: 'srgb' }).data
+            ]
+          };
+      }
+    return null;
+  });
+}
+
+/** @param {number[]} pixel */
+const hex = (pixel) =>
+  '#' +
+  pixel
+    .slice(0, 3)
+    .map((value) => value.toString(16).padStart(2, '0'))
+    .join('')
+    .toUpperCase();
+
+test('pieces are drawn in the Display P3 color space where the browser has it, so they look more vivid [DSP-6]', async ({
+  page
+}) => {
+  await page.goto('/');
+  await page.keyboard.press('Enter');
+  await expect.poll(() => filledCount(page)).toBe(4);
+  const { canvases, supported } = await colorSpaces(page);
+  expect(canvases).toEqual(Array(5).fill(supported ? 'display-p3' : 'srgb'));
+  const { own, srgb } = present(await firstPiecePixel(page));
+  expect(Object.values(PieceColors)).toContain(hex(own));
+  // In P3 the same values lie outside sRGB, so reading them as sRGB differs.
+  if (supported) expect(srgb).not.toEqual(own);
+});
+
+// The test helpers read the board's pixels through a context of their own.
+// Asking for one before the page did would once have made the board sRGB.
+test('another script asking for a canvas context first cannot change its color space [DSP-6]', async ({
+  page
+}) => {
+  await page.addInitScript(() => {
+    document.addEventListener('DOMContentLoaded', () => {
+      for (const canvas of document.querySelectorAll('canvas'))
+        canvas.getContext('2d');
+    });
+  });
+  await page.goto('/');
+  await page.keyboard.press('Enter');
+  await expect.poll(() => filledCount(page)).toBe(4);
+  const { canvases, supported } = await colorSpaces(page);
+  expect(canvases).toEqual(Array(5).fill(supported ? 'display-p3' : 'srgb'));
+  const { own } = present(await firstPiecePixel(page));
+  expect(Object.values(PieceColors)).toContain(hex(own));
+});
+
+test('without Display P3 canvases, pieces keep their usual colors [DSP-6]', async ({
+  page
+}) => {
+  await page.addInitScript(() => {
+    /** @type {unknown} */
+    const getContext = Reflect.get(HTMLCanvasElement.prototype, 'getContext');
+    if (typeof getContext !== 'function')
+      throw new Error('app: getContext is not a function');
+    Reflect.set(
+      HTMLCanvasElement.prototype,
+      'getContext',
+      /** @this {HTMLCanvasElement} */
+      function (
+        /** @type {string} */ type,
+        /** @type {object | undefined} */ options
+      ) {
+        /** @type {unknown} */
+        const context = Reflect.apply(getContext, this, [
+          type,
+          { ...options, colorSpace: 'srgb' }
+        ]);
+        return context;
+      }
+    );
+  });
+  await page.goto('/');
+  await page.keyboard.press('Enter');
+  await expect.poll(() => filledCount(page)).toBe(4);
+  expect((await colorSpaces(page)).canvases).toEqual(Array(5).fill('srgb'));
+  const { own, srgb } = present(await firstPiecePixel(page));
+  expect(Object.values(PieceColors)).toContain(hex(own));
+  expect(srgb).toEqual(own);
+});
+
+test('the screen stays on while playing, and may sleep when paused or after game over [DSP-7]', async ({
+  page
+}) => {
+  await fakeWakeLock(page, 'grant');
+  await page.goto('/');
+  await expect(page.locator('#newGameButton')).toBeVisible();
+  expect(await wakeLockCounts(page)).toEqual({ granted: 0, held: 0 });
+  await page.keyboard.press('Enter');
+  await expect
+    .poll(() => wakeLockCounts(page))
+    .toEqual({ granted: 1, held: 1 });
+  await page.keyboard.press('KeyP');
+  await expectLabel(page, 'Resume');
+  await expect
+    .poll(() => wakeLockCounts(page))
+    .toEqual({ granted: 1, held: 0 });
+  await page.keyboard.press('KeyP');
+  await expect
+    .poll(() => wakeLockCounts(page))
+    .toEqual({ granted: 2, held: 1 });
+  for (
+    let i = 0;
+    i < 30 && !(await page.locator('#newGameButton').isVisible());
+    i++
+  )
+    await page.keyboard.press('Space');
+  await expect(page.locator('#newGameButton')).toBeVisible();
+  await expect
+    .poll(() => wakeLockCounts(page))
+    .toEqual({ granted: 2, held: 0 });
+});
+
+test('a wake lock granted after play stopped, or after a newer request, is let go [DSP-7]', async ({
+  page
+}) => {
+  await fakeWakeLock(page, 'hold');
+  await page.goto('/');
+  // Each step waits for the page to act on it, so no two land in one frame.
+  await page.keyboard.press('Enter');
+  await expect.poll(() => wakeLockRequests(page)).toBe(1);
+  await page.keyboard.press('KeyP');
+  await expectLabel(page, 'Resume');
+  await page.keyboard.press('KeyP');
+  await expect.poll(() => wakeLockRequests(page)).toBe(2);
+  await page.evaluate(() => {
+    const run = window.grantWakeLocks;
+    if (!run) throw new Error('app: grantWakeLocks was not installed');
+    run();
+  });
+  await expect
+    .poll(() => wakeLockCounts(page))
+    .toEqual({ granted: 2, held: 1 });
+  await page.keyboard.press('KeyP');
+  await expectLabel(page, 'Resume');
+  await page.keyboard.press('KeyP');
+  await expect.poll(() => wakeLockRequests(page)).toBe(3);
+  await page.keyboard.press('KeyP');
+  await expectLabel(page, 'Resume');
+  await page.evaluate(() => {
+    const run = window.grantWakeLocks;
+    if (!run) throw new Error('app: grantWakeLocks was not installed');
+    run();
+  });
+  await expect
+    .poll(() => wakeLockCounts(page))
+    .toEqual({ granted: 3, held: 0 });
+});
+
+test('if the system takes the wake lock back during play, the game asks for it again [DSP-7]', async ({
+  page
+}) => {
+  await fakeWakeLock(page, 'grant');
+  await page.goto('/');
+  await page.keyboard.press('Enter');
+  await expect
+    .poll(() => wakeLockCounts(page))
+    .toEqual({ granted: 1, held: 1 });
+  await page.evaluate(() => {
+    const revoke = window.revokeWakeLocks;
+    if (!revoke) throw new Error('app: revokeWakeLocks was not installed');
+    revoke();
+  });
+  await expect
+    .poll(() => wakeLockCounts(page))
+    .toEqual({ granted: 2, held: 1 });
+  await page.keyboard.press('KeyP');
+  await expectLabel(page, 'Resume');
+  await expect
+    .poll(() => wakeLockCounts(page))
+    .toEqual({ granted: 2, held: 0 });
+  expect(await wakeLockRequests(page)).toBe(2);
+});
+
+/** @type {Array<'refuse' | 'missing'>} */
+const unavailableModes = ['refuse', 'missing'];
+for (const mode of unavailableModes) {
+  test(`the game plays normally when the wake lock is ${mode === 'refuse' ? 'refused' : 'unsupported'} [DSP-7]`, async ({
+    page
+  }) => {
+    const errors = trackErrors(page);
+    await fakeWakeLock(page, mode);
+    await page.goto('/');
+    await page.keyboard.press('Enter');
+    await expectLabel(page, 'Pause');
+    await expect.poll(() => filledCount(page)).toBe(4);
+    await page.keyboard.press('KeyP');
+    await expectLabel(page, 'Resume');
+    expect(errors).toEqual([]);
+  });
+}
+
+test('a whole game runs to the end without errors [SAF-6] [STA-3]', async ({
+  page
+}) => {
+  const errors = trackErrors(page);
+  await page.goto('/');
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#newGameButton')).toBeHidden();
+  for (let i = 0; i < 60; i++) {
+    if (await page.locator('#newGameButton').isVisible()) break;
+    for (const key of [
+      'KeyW',
+      'KeyZ',
+      'KeyA',
+      'KeyD',
+      'KeyH',
+      'ArrowDown',
+      'Space'
+    ])
+      await page.keyboard.press(key);
+  }
+  await expect(page.locator('#newGameButton')).toBeVisible();
+  expect(
+    (await boardCells(page)).flat().filter(Boolean).length
+  ).toBeGreaterThan(0);
+  expect(errors).toEqual([]);
+});

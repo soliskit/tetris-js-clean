@@ -1,0 +1,407 @@
+name: Mutation testing on pull requests
+
+# Every pull request runs this workflow. The plan job classifies every
+# changed path against a positive definition of the critical surface:
+# what the app's behavior or the mutation verdict depends on. The
+# definition names the served app (public/, index.js), the tests and
+# everything whose content their verdicts depend on (test/, e2e/,
+# delivery-e2e/, delivery-checks/, including inputs read outside the
+# test folders: docs/requirements.md is read by
+# test/traceability.test.js, and docs/sources/2-srs_table.txt is the
+# rotation-table oracle read by test/saveOracle.js), the build, release
+# and coverage tooling (scripts/), the dependency and tool configuration
+# (package.json, package-lock.json, stryker.config.json, the playwright
+# and tsconfig files, the lint and format configs, .gitignore), and the
+# CI definitions (.github/, including this classifier). A change
+# touching the definition runs every game file, fresh and in full. A
+# changed path outside the definition does not trigger mutation: the
+# plan job lists each such path in the run log and the check summary,
+# and the ordinary checks still run on the pull request. When a test,
+# build step or app process starts reading a new file, that file joins
+# the definition in the same change. A detected rename is classified on
+# both its old and new paths; a symlink, executable bit or typechange
+# runs every game file, and if the diff itself cannot be computed the
+# plan job fails instead of guessing. The aggregate check at the end
+# stands for the whole matrix, so the merge rule can require one stable
+# check name and stay satisfied as game files are added or renamed
+# (D85). Mutation testing fails a pull
+# request if any mutant that can change behavior survives. The threshold
+# is stryker.config.json's (break at 100); mutants that make the tests
+# run too long count as caught, and the exclusions marked in the code
+# stay excluded. Each game file is mutated in its own parallel run, so
+# the full check takes about as long as its largest file and new game
+# files are picked up on their own. The weekly full run stays as is.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      verdict: ${{ steps.classify.outputs.verdict }}
+      files: ${{ steps.classify.outputs.files }}
+      base_sha: ${{ steps.classify.outputs.base_sha }}
+      merge_base: ${{ steps.classify.outputs.merge_base }}
+      head_sha: ${{ steps.classify.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The base branch's full history, so the fork point exists.
+          fetch-depth: 0
+      - id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Resolve the moving base ref to a literal SHA, record the literal
+          # fork point and head; only literal SHAs are ever diffed. These
+          # SHAs certify the selection only; the mutation runs check out
+          # the pull request's merge state as before, so the tested tree
+          # is the checkout's, not necessarily this head.
+          git fetch --no-tags origin "+refs/heads/$GITHUB_BASE_REF:refs/remotes/origin/$GITHUB_BASE_REF"
+          base_sha=$(git rev-parse "origin/$GITHUB_BASE_REF")
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          echo "base_sha=$base_sha" | tee -a "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" | tee -a "$GITHUB_OUTPUT"
+          if ! git cat-file -e "$head_sha"; then
+            git fetch --no-tags origin "$head_sha"
+          fi
+          if ! merge_base=$(git merge-base "$base_sha" "$head_sha"); then
+            echo "The fork point cannot be resolved; failing closed."
+            exit 1
+          fi
+          echo "merge_base=$merge_base" | tee -a "$GITHUB_OUTPUT"
+          # Endpoint delta (the two-endpoint form of A...B): what this pull
+          # request itself changes, from the fork point to its head.
+          # --raw -z carries both revisions' modes and both paths on a
+          # rename, NUL-safe. -M keeps rename detection on; a detected
+          # rename classifies the old AND the new path.
+          git diff --raw -z -M "$merge_base" "$head_sha" > "$RUNNER_TEMP/diff.raw"
+          verdict=zero
+          changed=0
+          : > "$RUNNER_TEMP/unmatched.list"
+          classify() {
+            case "$1" in
+              # The positive critical definition: what the app's behavior
+              # or the mutation verdict depends on. A path outside it does
+              # not trigger mutation; it is listed in the run log and the
+              # check summary, and the ordinary checks still run.
+              public/*|index.js) verdict=full ;;
+              test/*|e2e/*|delivery-e2e/*|delivery-checks/*) verdict=full ;;
+              scripts/*) verdict=full ;;
+              docs/requirements.md) verdict=full ;;          # read by test/traceability.test.js
+              docs/sources/2-srs_table.txt) verdict=full ;;  # rotation-table oracle read by test/saveOracle.js
+              .github/*) verdict=full ;;
+              package.json|package-lock.json) verdict=full ;;
+              stryker.config.json|playwright.config.js|playwright.delivery.config.js) verdict=full ;;
+              tsconfig.json|tsconfig.tests.json|tsconfig.sw.json|tsconfig.generated-sw.json) verdict=full ;;
+              eslint.config.mjs|.prettierrc.json|.prettierignore|ruff.toml|lefthook.yml|.gitignore) verdict=full ;;
+              *) echo "$1" >> "$RUNNER_TEMP/unmatched.list" ;;
+            esac
+          }
+          while IFS= read -r -d '' meta; do
+            [ -n "$meta" ] || continue
+            IFS= read -r -d '' path1
+            changed=1
+            srcmode=$(echo "$meta" | awk '{print substr($1, 2)}')  # strip the leading colon
+            dstmode=$(echo "$meta" | awk '{print $2}')
+            status=$(echo "$meta" | awk '{print $5}')
+            # Strict rule: a symlink, executable bit, submodule or
+            # typechange is FULL. Adds, deletes and edits classify by path.
+            case "$srcmode $dstmode" in
+              *120000*|*100755*|*160000*) verdict=full ;;
+            esac
+            case "$status" in
+              T*) verdict=full ;;
+            esac
+            case "$status" in
+              R*|C*)
+                IFS= read -r -d '' path2
+                classify "$path1"
+                classify "$path2"
+                ;;
+              *)
+                classify "$path1"
+                ;;
+            esac
+          done < "$RUNNER_TEMP/diff.raw"
+          if [ "$changed" -eq 0 ]; then
+            echo "The pull request changes no files: a legitimate, reported empty diff."
+          fi
+          echo "verdict=$verdict" | tee -a "$GITHUB_OUTPUT"
+          if [ "$verdict" = full ]; then
+            # NUL-safe listing; the producer's exit is checked before the
+            # list is consumed, so a listing failure fails the plan instead
+            # of yielding a partial expected set.
+            if ! git ls-tree -r -z --name-only "$head_sha" -- public/game > "$RUNNER_TEMP/games.list"; then
+              echo "Cannot list the game files at the head; failing closed."
+              exit 1
+            fi
+            mapfile -d '' -t game_files < "$RUNNER_TEMP/games.list"
+            if [ "${#game_files[@]}" -eq 0 ]; then
+              echo "Full sweep requested but no game files exist at the head; failing closed."
+              exit 1
+            fi
+            # Only simple, portable file names are supported so every shard
+            # name below is safe. Anything else fails the plan rather than
+            # the matrix naming.
+            for f in "${game_files[@]}"; do
+              [[ "$f" =~ ^public/game/[A-Za-z0-9_-]+\.js$ ]] || { echo "Unsupported game file name: $f; failing closed."; exit 1; }
+            done
+            # Large game files split into line-range shards at gaps between
+            # class members, so the wall time follows a smaller shard instead
+            # of the largest file. Every shard range set is contiguous from
+            # line 1, ends with the 99999 sentinel to cover later file growth,
+            # and the mutation job re-verifies coverage against the parsed AST
+            # before running: a mutated node type spanning a boundary fails
+            # the job instead of being silently skipped. Whole-file entries carry the
+            # bare path in file; ranged entries append :start-end.
+            entries=()
+            for f in "${game_files[@]}"; do
+              base=$(basename "$f" .js)
+              case "$f" in
+                public/game/inputController.js) ranges=("1-157" "158-333" "334-99999") ;;
+                public/game/tetromino.js) ranges=("1-185" "186-99999") ;;
+                *) ranges=() ;;
+              esac
+              if [ "${#ranges[@]}" -eq 0 ]; then
+                entries+=("$(jq -n -c --arg f "$f" --arg n "$base" '{file: $f, name: $n}')")
+              else
+                total="${#ranges[@]}"
+                for idx in "${!ranges[@]}"; do
+                  entries+=("$(jq -n -c --arg f "$f:${ranges[$idx]}" --arg n "${base}-$((idx + 1))of${total}" --arg s "${ranges[*]}" '{file: $f, name: $n, shards: $s}')")
+                done
+              fi
+            done
+            matrix=$(jq -n -c --args '{include: [$ARGS.positional[] | fromjson]}' "${entries[@]}")
+            echo "files=$matrix" >> "$GITHUB_OUTPUT"
+            echo "Full sweep: ${#game_files[@]} game files in ${#entries[@]} shards."
+          else
+            echo "files={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "Zero mutation targets: no changed path is in the critical definition; the ordinary checks run separately."
+          fi
+          if [ -s "$RUNNER_TEMP/unmatched.list" ]; then
+            if [ "$verdict" = zero ]; then
+              echo "Outside the critical definition (mutation not triggered; the ordinary checks run separately):"
+            else
+              echo "Outside the critical definition (the full run is still triggered for this pull request):"
+            fi
+            while IFS= read -r p; do
+              echo "  $p"
+              echo "::notice title=Outside the critical definition::$p"
+            done < "$RUNNER_TEMP/unmatched.list"
+            {
+              echo '### Paths outside the critical definition'
+              echo ''
+              if [ "$verdict" = zero ]; then
+                echo 'Every changed path is outside the critical definition in this workflow, so no mutation run was triggered.'
+              else
+                echo 'These changed paths are outside the critical definition; the full mutation run is still triggered for this pull request.'
+              fi
+              echo 'The ordinary checks run separately on this pull request. If any of these paths can change behavior under test, add the path to the definition in this workflow.'
+              echo ''
+              while IFS= read -r p; do echo "- \`$p\`"; done < "$RUNNER_TEMP/unmatched.list"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+  mutation:
+    name: mutation (${{ matrix.name }})
+    needs: plan
+    if: needs.plan.outputs.verdict == 'full'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.files) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: package.json
+          cache: npm
+      - run: npm install --global npm@12.2.0
+      - run: npm ci
+      - name: Verify line-range shards split the file exactly (AST check)
+        if: contains(matrix.file, ':')
+        shell: bash
+        run: |
+          set -euo pipefail
+          mutate="${{ matrix.file }}"
+          file="${mutate%%:*}"
+          node --input-type=module - "$file" ${{ matrix.shards }} <<'GUARD'
+          // Fail-closed shard-boundary check for line-range mutation shards.
+          // Ranges must be contiguous from line 1 and cover the whole file (last
+          // range ends at EOF or the 99999 sentinel). No mutated-node type may span
+          // a range boundary (a spanning node is silently skipped by every shard);
+          // container types that no mutator targets may span because their children
+          // are still checked. Every range must contain at least one candidate
+          // mutable node (candidate presence is a static source check only - it is
+          // NOT proof of actual mutant generation; that is verified separately by
+          // comparing full mutant-report identities against an unsharded run).
+          import { readFileSync } from 'node:fs';
+          import { createRequire } from 'node:module';
+          const require = createRequire(process.cwd() + '/package.json');
+          const espree = require('espree');
+          const [file, ...ranges] = process.argv.slice(2);
+          const fail = (msg) => {
+            console.error(msg);
+            process.exit(1);
+          };
+          const MAY_SPAN = new Set([
+            'Program',
+            'ImportDeclaration',
+            'ExportNamedDeclaration',
+            'ExportDefaultDeclaration',
+            'ExportAllDeclaration',
+            'ClassDeclaration',
+            'ClassBody',
+            'MethodDefinition',
+            'PropertyDefinition',
+            'StaticBlock',
+            'FunctionDeclaration',
+            'VariableDeclaration',
+            'VariableDeclarator',
+          ]);
+          const source = readFileSync(file, 'utf8');
+          const lineCount = source.split('\n').length - (source.endsWith('\n') ? 1 : 0);
+          const boundaries = [];
+          const rangeList = [];
+          let expectStart = 1;
+          for (const r of ranges) {
+            const m = /^(\d+)-(\d+)$/.exec(r);
+            if (!m) fail(`Bad range "${r}"`);
+            const start = Number(m[1]);
+            const end = Number(m[2]);
+            if (start !== expectStart) fail(`Range gap or overlap at ${start} (expected ${expectStart})`);
+            if (start > lineCount) fail(`Range ${r} starts past end of file (${lineCount} lines)`);
+            if (end !== 99999 && end > lineCount) fail(`Range ${r} ends past end of file`);
+            if (end !== 99999) boundaries.push(end);
+            rangeList.push([start, Math.min(end, lineCount)]);
+            expectStart = end + 1;
+          }
+          // Tail coverage: the last range must reach EOF (fixed end == lineCount, or
+          // the 99999 sentinel which expectStart has already passed lineCount).
+          if (lineCount >= expectStart) {
+            fail(`Tail uncovered: file has ${lineCount} lines but ranges stop at ${expectStart - 1}`);
+          }
+          const ast = espree.parse(source, { ecmaVersion: 'latest', sourceType: 'module', loc: true });
+          const bad = [];
+          const candidates = rangeList.map(() => 0);
+          (function walk(node) {
+            if (!node || typeof node.type !== 'string') return;
+            if (!MAY_SPAN.has(node.type) && node.loc) {
+              for (const b of boundaries) {
+                if (node.loc.start.line <= b && node.loc.end.line >= b + 1) {
+                  bad.push(`${node.type} lines ${node.loc.start.line}-${node.loc.end.line} spans boundary ${b}`);
+                }
+              }
+              const s = node.loc.start.line;
+              const e = node.loc.end.line;
+              for (let i = 0; i < rangeList.length; i++) {
+                if (s >= rangeList[i][0] && e <= rangeList[i][1]) candidates[i]++;
+              }
+            }
+            for (const key of Object.keys(node)) {
+              const v = node[key];
+              if (Array.isArray(v)) v.forEach(walk);
+              else if (v && typeof v === 'object' && key !== 'loc') walk(v);
+            }
+          })(ast);
+          if (bad.length) fail(bad.join('\n'));
+          for (let i = 0; i < rangeList.length; i++) {
+            if (candidates[i] === 0) {
+              fail(`Range ${rangeList[i][0]}-${rangeList[i][1]} contains no candidate mutable nodes (candidate-count check; actual mutant identity is verified separately against an unsharded report)`);
+            }
+          }
+          console.log(`OK ${file}: ${boundaries.length} boundaries, ranges contiguous, tail covered, every range has candidate nodes, no mutable node spans`);
+          GUARD
+      - name: Mutate ${{ matrix.file }}
+        run: npx stryker run --mutate "${{ matrix.file }}"
+      # A zero-mutant shard reports NaN score and passes green even under
+      # thresholds.break (NaN < break is false), so a drift-emptied range
+      # would otherwise pass silently. Fail closed on an empty report.
+      - name: Verify this ranged shard produced mutants
+        if: contains(matrix.file, ':')
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const r = JSON.parse(require("fs").readFileSync("reports/mutation/mutation.json", "utf8"));
+            const total = Object.values(r.files ?? {}).reduce((n, f) => n + (f.mutants?.length ?? 0), 0);
+            if (total === 0) { console.error("Vacuous shard: mutation report lists 0 mutants"); process.exit(1); }
+            console.log(`Report lists ${total} mutants.`);
+          '
+      # Done-marker accounting, deliberately narrow: a marker attests that
+      # a shard with this name finished successfully in some attempt of
+      # this workflow run. overwrite keeps a re-run attempt able to
+      # re-publish. The finalize job's pass conditions are spelled out on
+      # that job.
+      - name: Record this shard as done
+        if: success()
+        run: echo "${{ matrix.file }}" > "done-${{ matrix.name }}.txt"
+      - name: Publish the done marker
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-done-${{ matrix.name }}
+          path: done-${{ matrix.name }}.txt
+          retention-days: 1
+          overwrite: true
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-report-${{ matrix.name }}
+          path: reports/mutation/
+          overwrite: true
+  # One check that stands for the whole matrix, so the merge rule requires
+  # a single check name that stays stable as game files come and go. It
+  # runs however the runs ended. It passes only when all of these hold:
+  # the plan job succeeded; and either the plan recorded a legitimate
+  # zero, or the aggregate matrix result is success AND the plan's
+  # expected shard names exactly match the done-marker names collected
+  # in this workflow run. The markers are same-workflow-run filename
+  # accounting - they may come from an earlier attempt of this run, so
+  # they are not independent proof that the current attempt executed
+  # every shard.
+  finalize:
+    name: mutation (all)
+    needs: [plan, mutation]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Plan and mutation results
+        run: |
+          if [ "${{ needs.plan.result }}" != "success" ]; then
+            echo "The plan job ended as: ${{ needs.plan.result }}"
+            exit 1
+          fi
+          if [ "${{ needs.plan.outputs.verdict }}" = "zero" ]; then
+            echo "The plan recorded a legitimate zero: nothing to mutate."
+          elif [ "${{ needs.mutation.result }}" != "success" ]; then
+            echo "The mutation runs ended as: ${{ needs.mutation.result }}"
+            exit 1
+          fi
+      - name: Collect the done markers
+        if: needs.plan.outputs.verdict == 'full'
+        uses: actions/download-artifact@v7
+        with:
+          pattern: mutation-done-*
+          merge-multiple: true
+      - name: Every expected shard is accounted for
+        if: needs.plan.outputs.verdict == 'full'
+        run: |
+          set -euo pipefail
+          jq -r '[.include[].name] | sort | .[]' <<< '${{ needs.plan.outputs.files }}' > expected.txt
+          ls done-*.txt | sed -e 's/^done-//' -e 's/\.txt$//' | sort -u > actual.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "The mutation matrix does not match the plan's expected shard set."
+            exit 1
+          fi
+          echo "All $(wc -l < expected.txt) expected shards are accounted for."
+

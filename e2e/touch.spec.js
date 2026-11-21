@@ -1,0 +1,646 @@
+import { test, expect } from './fixtures.js';
+import {
+  BOARD_COLOR,
+  PieceColors,
+  boardTouch,
+  canvasHasDrawing,
+  cellsOf,
+  continueSavedGame,
+  isChromium,
+  rowsExcept,
+  savedGame
+} from './helpers.js';
+
+test.skip(
+  ({ hasTouch }) => !hasTouch,
+  'touch gestures run on the phone sized project'
+);
+
+/** @param {number[][]} cells */
+const minColumn = (cells) => Math.min(...cells.map(([, c]) => c));
+/** @param {number[][]} cells */
+const minRow = (cells) => Math.min(...cells.map(([r]) => r));
+/** @param {number[][]} cells */
+const shapeOf = (cells) => {
+  const r0 = minRow(cells);
+  const c0 = minColumn(cells);
+  return JSON.stringify(cells.map(([r, c]) => [r - r0, c - c0]).sort());
+};
+
+/**
+ * @param {import('@playwright/test').Page} page
+ * @param {Parameters<typeof savedGame>[0]} options
+ */
+async function playSaved(page, options) {
+  await continueSavedGame(page, savedGame(options));
+  await page.keyboard.press('KeyP');
+}
+
+test('tapping the board rotates the piece, even with a little finger wobble [INP-5]', async ({
+  page
+}) => {
+  await playSaved(page, {
+    piece: PieceColors.purple,
+    position: { row: 5, column: 3 }
+  });
+  const touch = await boardTouch(page);
+  const t = () => cellsOf(page, PieceColors.purple);
+  const first = shapeOf(await t());
+  await touch.down(5, 15);
+  await touch.up();
+  await expect.poll(async () => shapeOf(await t())).not.toBe(first);
+  const second = shapeOf(await t());
+  await touch.down(5, 15);
+  await touch.moveBy(6 / touch.cell, 3 / touch.cell, 2); // about 6px of wobble
+  await touch.up();
+  await expect.poll(async () => shapeOf(await t())).not.toBe(second);
+});
+
+test('a second finger on the board does nothing: the first keeps its drag, and neither lift is a tap [INP-5]', async ({
+  page
+}) => {
+  test.skip(!isChromium(page), 'only Chromium can send real touch events');
+  await page.clock.install();
+  await continueSavedGame(
+    page,
+    savedGame({ piece: PieceColors.purple, position: { row: 5, column: 3 } })
+  );
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000));
+  await page.keyboard.press('KeyP');
+  await page.clock.runFor(17);
+  const box = await page.locator('#tetris').boundingBox();
+  if (!box) throw new Error('touch: #tetris has no bounding box');
+  const cell = box.width / 10;
+  /**
+   * @param {number} id
+   * @param {number} column
+   * @param {number} row
+   */
+  const finger = (id, column, row) => ({
+    id,
+    x: box.x + cell * column,
+    y: box.y + cell * row
+  });
+  const cdp = await page.context().newCDPSession(page);
+  // Lists every finger still down; the one added or left out is the one that changed.
+  /**
+   * @param {'touchStart' | 'touchEnd' | 'touchMove' | 'touchCancel'} type
+   * @param {Array<{ id: number, x: number, y: number }>} fingers
+   */
+  const send = (type, fingers) =>
+    cdp.send('Input.dispatchTouchEvent', { type, touchPoints: fingers });
+  const piece = async () => {
+    await page.clock.runFor(17);
+    const cells = await cellsOf(page, PieceColors.purple);
+    expect(cells).toHaveLength(4);
+    return cells;
+  };
+  const shape = shapeOf(await piece());
+
+  // Two fingers put down and lifted without moving: no turn.
+  await send('touchStart', [finger(0, 4, 12)]);
+  await send('touchStart', [finger(0, 4, 12), finger(1, 7, 15)]);
+  await send('touchEnd', [finger(0, 4, 12)]);
+  await send('touchEnd', []);
+  await page.clock.runFor(17);
+  expect(shapeOf(await piece())).toBe(shape);
+
+  // The first finger drags with a second resting on the board: the piece follows the first.
+  await send('touchStart', [finger(0, 4, 12)]);
+  await send('touchStart', [finger(0, 4, 12), finger(1, 7, 15)]);
+  const beforeSecondaryMove = await piece();
+  await send('touchMove', [finger(0, 4, 12), finger(1, 9, 17)]);
+  expect(await piece()).toEqual(beforeSecondaryMove);
+  for (let step = 1; step <= 13; step++)
+    await send('touchMove', [
+      finger(0, 4 + (2.6 * step) / 13, 12),
+      finger(1, 9, 17)
+    ]);
+  await expect.poll(async () => minColumn(await piece())).toBe(6);
+  await send('touchEnd', [finger(0, 6.6, 12)]);
+  // Lifting the secondary finger does not end the primary drag.
+  for (let step = 1; step <= 5; step++)
+    await send('touchMove', [finger(0, 6.6 - step / 5, 12)]);
+  expect(minColumn(await piece())).toBe(5);
+  await send('touchEnd', []);
+  expect(shapeOf(await piece())).toBe(shape);
+  expect(minColumn(await piece())).toBe(5);
+
+  // If the primary lifts first, the remaining finger cannot take over or tap.
+  await send('touchStart', [finger(0, 4, 12)]);
+  await send('touchStart', [finger(0, 4, 12), finger(1, 7, 15)]);
+  const beforePrimaryLift = await piece();
+  await send('touchEnd', [finger(1, 7, 15)]);
+  await send('touchMove', [finger(1, 9, 17)]);
+  expect(await piece()).toEqual(beforePrimaryLift);
+  await send('touchEnd', []);
+  expect(await piece()).toEqual(beforePrimaryLift);
+});
+
+// Use native mouse pointer events for exact CSS-pixel coordinates on both
+// engines. The existing gesture tests separately exercise Chromium touch.
+for (const { name, distances, rotates, cancel = false } of [
+  { name: 'below 10 pixels', distances: [9], rotates: true },
+  { name: 'exactly 10 pixels', distances: [10], rotates: true },
+  { name: 'above 10 pixels', distances: [11], rotates: false },
+  { name: 'exactly 10 pixels and back', distances: [10, 0], rotates: true },
+  { name: 'beyond 10 pixels and back', distances: [11, 0], rotates: false },
+  {
+    name: 'cancelled at exactly 10 pixels',
+    distances: [10],
+    rotates: false,
+    cancel: true
+  }
+]) {
+  test(`a pointer gesture ${name} preserves the tap boundary [INP-5]`, async ({
+    page
+  }) => {
+    await playSaved(page, {
+      piece: PieceColors.purple,
+      position: { row: 5, column: 3 }
+    });
+    const first = shapeOf(await cellsOf(page, PieceColors.purple));
+    const box = await page.locator('#tetris').boundingBox();
+    if (!box) throw new Error('touch: #tetris has no bounding box');
+    const start = {
+      x: Math.round(box.x + box.width / 2),
+      y: Math.round(box.y + box.height / 2)
+    };
+    await page.evaluate(() => {
+      /** @type {Array<{ type: string, x: number, y: number, pointerId: number }>} */
+      const events = [];
+      window.boundaryEvents = events;
+      const board = document.getElementById('tetris');
+      if (!board) throw new Error('touch: #tetris not found');
+      for (const type of ['pointerdown', 'pointermove']) {
+        board.addEventListener(type, (event) => {
+          if (!(event instanceof PointerEvent))
+            throw new Error('touch: board event is not a PointerEvent');
+          events.push({
+            type,
+            x: event.clientX,
+            y: event.clientY,
+            pointerId: event.pointerId
+          });
+        });
+      }
+    });
+    await page.mouse.move(start.x, start.y);
+    await page.mouse.down();
+    for (const distance of distances)
+      await page.mouse.move(start.x + distance, start.y);
+    const delivered = await page.evaluate(() => {
+      const events = window.boundaryEvents;
+      if (!events) throw new Error('touch: boundary events were not recorded');
+      const down = events.find((event) => event.type === 'pointerdown');
+      if (!down) throw new Error('touch: no pointerdown was recorded');
+      return events
+        .filter(
+          (event) =>
+            event.type === 'pointermove' && event.pointerId === down.pointerId
+        )
+        .filter((event) => events.indexOf(event) > events.indexOf(down))
+        .map((event) => Math.hypot(event.x - down.x, event.y - down.y));
+    });
+    expect(delivered).toEqual(distances);
+    // Movement alone must not rotate. This also proves the boundary move
+    // reached the page before the up/cancel event.
+    expect(shapeOf(await cellsOf(page, PieceColors.purple))).toBe(first);
+    if (cancel) {
+      const pointerId = await page.evaluate(() => {
+        const down = window.boundaryEvents?.find(
+          (event) => event.type === 'pointerdown'
+        );
+        if (!down) throw new Error('touch: no pointerdown was recorded');
+        return down.pointerId;
+      });
+      await page
+        .locator('#tetris')
+        .dispatchEvent('pointercancel', { pointerId });
+    }
+    await page.mouse.up();
+    if (rotates)
+      await expect
+        .poll(async () => shapeOf(await cellsOf(page, PieceColors.purple)))
+        .not.toBe(first);
+    else expect(shapeOf(await cellsOf(page, PieceColors.purple))).toBe(first);
+  });
+}
+
+test('tapping the hold box holds the piece [INP-5] [PLY-7]', async ({
+  page
+}) => {
+  await playSaved(page, { piece: PieceColors.purple });
+  await page.locator('#heldPreview').tap();
+  await expect.poll(() => canvasHasDrawing(page, 'heldPreview')).toBe(true);
+});
+
+test('dragging sideways moves one column per cell dragged [INP-5]', async ({
+  page
+}) => {
+  await playSaved(page, {
+    piece: PieceColors.purple,
+    position: { row: 5, column: 3 }
+  });
+  const touch = await boardTouch(page);
+  await touch.down(4, 12);
+  await touch.moveBy(2.6, 0, 13);
+  await expect
+    .poll(async () => minColumn(await cellsOf(page, PieceColors.purple)))
+    .toBe(6);
+  await touch.moveBy(-2.6, 0, 13);
+  await expect
+    .poll(async () => minColumn(await cellsOf(page, PieceColors.purple)))
+    .toBe(3);
+  await touch.up();
+});
+
+test('dragging down soft drops one row per cell dragged [INP-5] [PLY-3]', async ({
+  page
+}) => {
+  await playSaved(page, {
+    piece: PieceColors.purple,
+    position: { row: 2, column: 3 }
+  });
+  const touch = await boardTouch(page);
+  await touch.down(4, 8);
+  await touch.moveBy(0, 3.2, 12);
+  await expect
+    .poll(async () => minRow(await cellsOf(page, PieceColors.purple)))
+    .toBeGreaterThanOrEqual(5);
+  await touch.up();
+
+  await page.clock.install();
+  // The original positive-control drag above stays. Reload a supported
+  // piece for the blocked-distance scenario without changing the test set.
+  await page.addInitScript(
+    (values) => {
+      for (const [key, value] of Object.entries(values))
+        localStorage.setItem(key, String(value));
+    },
+    savedGame({
+      piece: PieceColors.yellow,
+      position: { row: 10, column: 3 },
+      board: [
+        [12, 3],
+        [12, 4]
+      ]
+    })
+  );
+  await page.goto('/');
+  await page.keyboard.press('KeyC');
+  await expect(page.locator('#playPauseButton')).toHaveAttribute(
+    'aria-label',
+    'Resume'
+  );
+  // Freeze while the continued game is still paused; waitForFunction in the
+  // startup helper needs frames, but gravity must not run during this drag.
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000));
+  await page.keyboard.press('KeyP');
+  const blockedTouch = await boardTouch(page);
+  const piece = async () => {
+    await page.clock.runFor(17);
+    const cells = await cellsOf(page, PieceColors.yellow);
+    expect(cells).toHaveLength(4); // A locked piece plus the next same-color piece would leave eight.
+    return cells;
+  };
+  const initial = await piece();
+  expect(minRow(initial)).toBe(10);
+  await blockedTouch.down(4, 11);
+  await blockedTouch.moveBy(0, 3.2, 12);
+  expect(await piece()).toEqual(initial);
+  await blockedTouch.moveBy(3, 0, 12);
+  const aside = await piece();
+  expect(minRow(aside)).toBe(10);
+  expect(minColumn(aside)).toBe(minColumn(initial) + 3);
+  // Both floor(3.2 + 1.5) - floor(3.2) and trunc(1.5) equal one.
+  await blockedTouch.moveBy(0, 1.5, 8);
+  const freshDown = await piece();
+  expect(minRow(freshDown)).toBe(11);
+  expect(minColumn(freshDown)).toBe(minColumn(aside));
+  await blockedTouch.up();
+});
+
+test('a dragged piece is never drawn over locked blocks [INP-5] [PCE-6]', async ({
+  page
+}) => {
+  await playSaved(page, {
+    piece: PieceColors.yellow,
+    position: { row: 6, column: 4 },
+    board: rowsExcept(
+      [...Array(16).keys()].map((i) => i + 4),
+      [0, 1, 2, 3, 4, 5]
+    )
+  });
+  const touch = await boardTouch(page);
+  await touch.down(5, 7);
+  await touch.moveBy(1.4, 0, 7);
+  const rightEdge = await page.evaluate(() => {
+    const canvas = document.getElementById('tetris');
+    if (!(canvas instanceof HTMLCanvasElement))
+      throw new Error('touch: #tetris is not a canvas');
+    const size = canvas.width / 10;
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('touch: #tetris has no 2d context');
+    const pixels = context.getImageData(
+      0,
+      Math.floor(size * 7.5),
+      canvas.width,
+      1
+    ).data;
+    let last = -1;
+    for (let x = 0; x < canvas.width; x++) {
+      const [r, g, b] = pixels.slice(x * 4, x * 4 + 3);
+      if (r > 200 && g > 170 && b < 90) last = x;
+    }
+    return last / size;
+  });
+  expect(rightEdge).toBeLessThanOrEqual(6);
+  expect(await cellsOf(page, BOARD_COLOR)).toHaveLength(64);
+  await touch.up();
+});
+
+test('after pushing into a wall, dragging back responds within a cell [INP-5]', async ({
+  page
+}) => {
+  await playSaved(page, {
+    piece: PieceColors.yellow,
+    position: { row: 6, column: 4 },
+    board: rowsExcept(
+      [...Array(16).keys()].map((i) => i + 4),
+      [0, 1, 2, 3, 4, 5]
+    )
+  });
+  const touch = await boardTouch(page);
+  await touch.down(5, 7);
+  await touch.moveBy(3, 0, 15); // three cells into the wall
+  expect(minColumn(await cellsOf(page, PieceColors.yellow))).toBe(4);
+  await touch.moveBy(-0.6, 0, 3);
+  await expect
+    .poll(async () => minColumn(await cellsOf(page, PieceColors.yellow)))
+    .toBe(3);
+  await touch.up();
+});
+
+test('a drag that outlives its piece leaves the next piece alone [INP-5]', async ({
+  page
+}) => {
+  await playSaved(page, {
+    piece: PieceColors.purple,
+    position: { row: 17, column: 3 }
+  });
+  const touch = await boardTouch(page);
+  await touch.down(4, 10);
+  await touch.moveBy(0, 1.2, 3); // onto the floor
+  await expect
+    .poll(
+      async () =>
+        (await cellsOf(page, PieceColors.purple)).filter(([r]) => r < 4).length,
+      { timeout: 3000 }
+    )
+    .toBe(4);
+  const topPiece = async () =>
+    (await cellsOf(page, PieceColors.purple)).filter(([r]) => r < 6);
+  const spawned = await topPiece();
+  await touch.moveBy(3, 5, 10); // would move it 3 columns and drop it 5 rows
+  await page.waitForTimeout(100);
+  const after = await topPiece();
+  expect(after).toHaveLength(4);
+  expect(minColumn(after)).toBe(minColumn(spawned));
+  expect(minRow(after) - minRow(spawned)).toBeLessThanOrEqual(1); // at most one gravity step
+  await touch.up();
+});
+
+test('a drag step that locks its piece ends the drag for the rest of that move [INP-5]', async ({
+  page
+}) => {
+  // The saved square has used its fifteen lock-delay resets, so landing
+  // locks at once (PLY-6). One move event carries the finger past two
+  // cells: the first step lands and locks the square, and the event's
+  // remaining step must not reach the piece that just appeared.
+  await page.clock.install();
+  await continueSavedGame(
+    page,
+    savedGame({
+      piece: PieceColors.yellow,
+      position: { row: 10, column: 0 },
+      board: [[12, 2]],
+      lockDelayResetCount: 15
+    })
+  );
+  // Freeze while the continued game is still paused, so gravity cannot
+  // step the square to a new low and refund its lock-delay resets.
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000));
+  await page.keyboard.press('KeyP');
+  const touch = await boardTouch(page);
+  await touch.down(1, 11);
+  await touch.moveBy(2.2, 0, 1); // one event, two steps
+  await page.clock.runFor(17);
+  const yellow = await cellsOf(page, PieceColors.yellow);
+  // The dragged square locked where the first step put it.
+  expect(yellow.filter(([r]) => r >= 9).sort()).toEqual([
+    [10, 1],
+    [10, 2],
+    [11, 1],
+    [11, 2]
+  ]);
+  // The next square stays in its starting columns, unmoved by the drag.
+  expect(minColumn(yellow.filter(([r]) => r < 9))).toBe(4);
+});
+
+test('a piece pushed against a ledge slides in once it drops below it [INP-5]', async ({
+  page
+}) => {
+  await playSaved(page, {
+    piece: PieceColors.yellow,
+    position: { row: 2, column: 4 },
+    board: rowsExcept([0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]) // a ledge in columns 6 to 9
+  });
+  const touch = await boardTouch(page);
+  await touch.down(5, 4);
+  await touch.moveBy(1.4, 0, 7); // pushes into the ledge: blocked
+  expect(minColumn(await cellsOf(page, PieceColors.yellow))).toBe(4);
+  await touch.moveBy(0, 5, 10); // soft drop below the ledge
+  await touch.moveBy(0.2, 0, 1); // still pushing right
+  await expect
+    .poll(async () => minColumn(await cellsOf(page, PieceColors.yellow)))
+    .toBe(5);
+  await touch.up();
+});
+
+/**
+ * @param {import('@playwright/test').Page} page
+ * @param {string} selector
+ */
+async function centerOf(page, selector) {
+  const box = await page.locator(selector).boundingBox();
+  if (!box) throw new Error(`touch: ${selector} has no bounding box`);
+  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+}
+
+// Safari zooms on a double tap that lands on something it does not take to be
+// clickable, which only click and mouse button listeners make an element.
+test('the board listens for clicks, so Safari takes quick taps there as clicks rather than a double tap to zoom [DSP-4]', async ({
+  page
+}) => {
+  test.skip(!isChromium(page), 'only Chromium can send real touch events');
+  await page.addInitScript(() => {
+    /** @type {string[]} */
+    const listened = [];
+    window.listenedFor = listened;
+    /** @type {unknown} */
+    const addEventListener = Reflect.get(
+      EventTarget.prototype,
+      'addEventListener'
+    );
+    if (typeof addEventListener !== 'function')
+      throw new Error('EventTarget.addEventListener is not a function');
+    Reflect.set(
+      EventTarget.prototype,
+      'addEventListener',
+      /** @this {EventTarget} */
+      function (/** @type {string} */ type, /** @type {unknown[]} */ ...rest) {
+        /** @type {unknown} */
+        const id = Reflect.get(this, 'id');
+        listened.push(`${typeof id === 'string' ? id : ''} ${type}`);
+        Reflect.apply(addEventListener, this, [type, ...rest]);
+      }
+    );
+  });
+  await page.goto('/');
+  expect(await page.evaluate(() => window.listenedFor)).toContain(
+    'tetris click'
+  );
+  // Clickable, it would otherwise flash on every tap.
+  expect(
+    await page.evaluate(() => {
+      const board = document.getElementById('tetris');
+      if (!board) throw new Error('touch: #tetris not found');
+      return getComputedStyle(board).getPropertyValue(
+        '-webkit-tap-highlight-color'
+      );
+    })
+  ).toBe('rgba(0, 0, 0, 0)');
+});
+
+test('two quick taps turn the piece twice, and no more [INP-5] [DSP-4]', async ({
+  page
+}) => {
+  test.skip(!isChromium(page), 'only Chromium can send real touch events');
+  await playSaved(page, {
+    piece: PieceColors.purple,
+    position: { row: 5, column: 3 }
+  });
+  const board = await centerOf(page, '#tetris');
+  await page.touchscreen.tap(board.x, board.y);
+  await page.touchscreen.tap(board.x, board.y);
+  // Turned twice, the T points down.
+  const pointingDown = shapeOf([
+    [0, 0],
+    [0, 1],
+    [0, 2],
+    [1, 1]
+  ]);
+  await expect
+    .poll(async () => shapeOf(await cellsOf(page, PieceColors.purple)))
+    .toBe(pointingDown);
+  // The click that follows each tap, a moment later, turns it no further.
+  await page.waitForTimeout(500);
+  expect(shapeOf(await cellsOf(page, PieceColors.purple))).toBe(pointingDown);
+});
+
+test('a quick tap on the hold box right after one on the board still holds [INP-5] [PLY-7]', async ({
+  page
+}) => {
+  test.skip(!isChromium(page), 'only Chromium can send real touch events');
+  await playSaved(page, { piece: PieceColors.purple });
+  const board = await centerOf(page, '#tetris');
+  const held = await centerOf(page, '#heldPreview');
+  await page.touchscreen.tap(board.x, board.y);
+  await page.touchscreen.tap(held.x, held.y);
+  await expect.poll(() => canvasHasDrawing(page, 'heldPreview')).toBe(true);
+});
+
+test('if Safari zooms in anyway, its gestures are let through so the player can zoom back out [DSP-4]', async ({
+  page
+}) => {
+  await page.goto('/');
+  // No test browser here really zooms (Chromium ignores a simulated pinch or
+  // double tap), so Safari zooming in is stood in for by the scale the page reads.
+  await page.evaluate(() => {
+    const viewport = visualViewport;
+    if (!viewport) throw new Error('touch: visualViewport is missing');
+    let scale = 1;
+    Object.defineProperty(viewport, 'scale', {
+      get: () => scale,
+      configurable: true
+    });
+    window.zoomTo = (value) => {
+      scale = value;
+      viewport.dispatchEvent(new Event('resize'));
+    };
+  });
+  const zoomState = () =>
+    page.evaluate(() => {
+      const gesture = new Event('gesturestart', { cancelable: true });
+      document.dispatchEvent(gesture);
+      const htmlTouchAction = getComputedStyle(
+        document.documentElement
+      ).touchAction;
+      const board = document.getElementById('tetris');
+      if (!board) throw new Error('touch: #tetris not found');
+      return {
+        htmlTouchAction,
+        boardTouchAction: getComputedStyle(board).touchAction,
+        pinchCancelled: gesture.defaultPrevented
+      };
+    });
+  await page.evaluate(() => {
+    const zoomTo = window.zoomTo;
+    if (!zoomTo) throw new Error('touch: zoomTo was not installed');
+    zoomTo(2);
+  });
+  expect(await zoomState()).toEqual({
+    htmlTouchAction: 'auto',
+    boardTouchAction: 'auto',
+    pinchCancelled: false
+  });
+  // Zoomed back out, zooming is blocked again.
+  await page.evaluate(() => {
+    const zoomTo = window.zoomTo;
+    if (!zoomTo) throw new Error('touch: zoomTo was not installed');
+    zoomTo(1);
+  });
+  expect(await zoomState()).toEqual({
+    htmlTouchAction: 'none',
+    boardTouchAction: 'none',
+    pinchCancelled: true
+  });
+});
+
+test('a page that opens already zoomed in, as Safari keeps the zoom on reload, lets the player zoom back out [DSP-4]', async ({
+  page
+}) => {
+  // Stands in for Safari's restored zoom, as no test browser here really zooms.
+  // No resize event comes, so the page has to notice the zoom as it starts.
+  await page.addInitScript(() => {
+    const viewport = visualViewport;
+    if (!viewport) throw new Error('touch: visualViewport is missing');
+    Object.defineProperty(viewport, 'scale', {
+      get: () => 2,
+      configurable: true
+    });
+    viewport.addEventListener = () => {};
+  });
+  await page.goto('/');
+  expect(
+    await page.evaluate(() => {
+      const gesture = new Event('gesturestart', { cancelable: true });
+      document.dispatchEvent(gesture);
+      return {
+        zoomed: document.documentElement.classList.contains('zoomed'),
+        pinchCancelled: gesture.defaultPrevented
+      };
+    })
+  ).toEqual({ zoomed: true, pinchCancelled: false });
+});

@@ -1,0 +1,52 @@
+{
+  "name": "tetris",
+  "version": "1.0.0",
+  "description": "Tetris for your web browser",
+  "main": "index.js",
+  "type": "module",
+  "engines": {
+    "node": "26.13.0",
+    "npm": ">=12.2.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node scripts/native-coverage.cjs --test --experimental-test-coverage --test-coverage-include=\"public/game/**\" --test-coverage-lines=100 --test-coverage-branches=100 --test-coverage-functions=100",
+    "test:e2e": "playwright test && playwright test --config playwright.delivery.config.js && node scripts/browser-coverage.js",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.sw.json && tsc -p tsconfig.generated-sw.json",
+    "typecheck:tests": "node --max-old-space-size=4096 node_modules/typescript/bin/tsc -p tsconfig.tests.json",
+    "test:mutation": "stryker run",
+    "test:all": "npm run build && npm run typecheck && npm test && npm run test:delivery:unit && npm run test:e2e",
+    "lint": "eslint . && node scripts/check-generated-release.mjs",
+    "format:check": "prettier --check .",
+    "build": "node scripts/build-release.mjs",
+    "verify:release": "node scripts/verify-release.mjs dist .release-evidence",
+    "test:delivery:unit": "node --test delivery-checks/*.js"
+  },
+  "author": "David Solis",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^5.3.0"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "^1.64.1",
+    "@stryker-mutator/core": "^10.1.1",
+    "@types/node": "^26.6.6",
+    "esbuild": "0.28.2",
+    "eslint": "10.15.0",
+    "eslint-config-prettier": "10.1.8",
+    "eslint-plugin-prettier": "5.5.7",
+    "eslint-plugin-promise": "7.3.0",
+    "globals": "17.14.0",
+    "istanbul-lib-coverage": "^3.2.2",
+    "istanbul-lib-report": "^3.0.1",
+    "istanbul-reports": "^3.2.0",
+    "prettier": "3.10.1",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "8.73.0",
+    "v8-to-istanbul": "^9.3.0"
+  }
+}

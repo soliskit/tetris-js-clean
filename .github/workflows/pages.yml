@@ -1,0 +1,139 @@
+name: Test and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    env:
+      QUALIFICATION_HEAD: ${{ github.sha }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tests: ${{ steps.counts.outputs.tests }}
+      skipped: ${{ steps.counts.outputs.skipped }}
+      e2e_expected: ${{ steps.e2e.outputs.expected }}
+      e2e_skipped: ${{ steps.e2e.outputs.skipped }}
+      delivery_passed: ${{ steps.e2e.outputs.delivery_passed }}
+      delivery_skipped: ${{ steps.e2e.outputs.delivery_skipped }}
+    steps:
+      - name: Set the owned receipt path
+        shell: bash
+        run: echo "QUALIFICATION_EVIDENCE=$RUNNER_TEMP/normal-browser-receipts" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: package.json
+          cache: npm
+      - run: npm install --global npm@12.2.0
+      - run: npm ci --ignore-scripts
+      - uses: actions/setup-python@v6
+      - run: pip install ruff==0.17.4
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: npm run build
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npx playwright install --with-deps chromium webkit
+      - name: Check Playwright package version
+        run: node -e "process.exit(require('playwright/package.json').version==='1.65.1'?0:1)"
+      - run: npm run typecheck
+      - run: npm run typecheck:tests
+      - name: Check the generated distribution
+        run: npm run test:delivery:unit
+      - name: Run the unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee test-output.txt
+      - name: Count the unit tests
+        id: counts
+        if: always()
+        shell: bash
+        run: |
+          count() { grep -E "^(#|ℹ) $1 [0-9]+" test-output.txt | tail -n 1 | grep -oE '[0-9]+$' || true; }
+          echo "tests=$(count tests)" >> "$GITHUB_OUTPUT"
+          echo "skipped=$(count skipped)" >> "$GITHUB_OUTPUT"
+      - name: Prepare fresh separate browser receipts
+        run: mkdir "$QUALIFICATION_EVIDENCE"
+      - name: Run original-source browser tests
+        env:
+          QUALIFICATION_SUITE: source
+        run: node node_modules/playwright/cli.js test --config playwright.config.js --reporter=list,.github/offline-current/qualification-reporter.mjs --output test-results/source-current
+      - name: Run built-delivery browser tests
+        env:
+          QUALIFICATION_SUITE: delivery
+        run: node node_modules/playwright/cli.js test --config playwright.delivery.config.js --reporter=list,.github/offline-current/qualification-reporter.mjs --output test-results/delivery-current
+      - name: Save reload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reload-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/delivery-current/generated-incomplete-or-*/reload-evidence.json
+          if-no-files-found: error
+          retention-days: 7
+      - run: node scripts/browser-coverage.js
+      - name: Validate complete browser results and screenshot assignments
+        run: python3 .github/offline-current/validate-reports.py
+      - name: Count each completed suite independently
+        id: e2e
+        shell: bash
+        run: |
+          python3 - <<'PYCOUNT'
+          import json, os, pathlib
+          report = json.loads((pathlib.Path(os.environ['QUALIFICATION_EVIDENCE']) / 'validated-browser-receipts.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for name, value in {'expected': report['suites']['source']['expected'], 'skipped': report['suites']['source']['skipped'], 'delivery_passed': report['suites']['delivery']['passed'], 'delivery_skipped': report['suites']['delivery']['skipped']}.items():
+                  output.write(f'{name}={value}\n')
+          PYCOUNT
+      - uses: actions/upload-artifact@v7
+        with:
+          name: browser-proof-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/normal-browser-receipts
+          if-no-files-found: error
+          retention-days: 7
+      - name: Record exact qualified output identity
+        run: node scripts/print-release-identity.mjs
+
+  # Final gate. Fails unless the test job succeeded, the unit tests and the
+  # browser tests each ran at least one test. Unit tests may skip none. The
+  # browser tests may skip at most 30: the tests that skip by design on
+  # projects where they do not apply (see test.skip in e2e/*.spec.js).
+  # It does not cover the mutation check.
+  suites-ran:
+    name: Suites ran
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULT: ${{ needs.test.result }}
+          UNIT_TESTS: ${{ needs.test.outputs.tests }}
+          UNIT_SKIPPED: ${{ needs.test.outputs.skipped }}
+          E2E_EXPECTED: ${{ needs.test.outputs.e2e_expected }}
+          E2E_SKIPPED: ${{ needs.test.outputs.e2e_skipped }}
+          DELIVERY_PASSED: ${{ needs.test.outputs.delivery_passed }}
+          DELIVERY_SKIPPED: ${{ needs.test.outputs.delivery_skipped }}
+        run: |
+          fail=0
+          check() {
+            name="$1"; result="$2"; tests="${3:-0}"; skipped="${4:-0}"; allowed="$5"
+            echo "$name: result=$result tests=$tests skipped=$skipped (allowed skipped: $allowed)"
+            [ "$result" = success ] || { echo "  $name did not succeed"; fail=1; }
+            [ "$tests" -ge 1 ] || { echo "  $name counted no tests"; fail=1; }
+            [ "$skipped" -le "$allowed" ] || { echo "  $name skipped more than allowed"; fail=1; }
+          }
+          check unit "$RESULT" "$UNIT_TESTS" "$UNIT_SKIPPED" 0
+          check source-browser "$RESULT" "$E2E_EXPECTED" "$E2E_SKIPPED" 30
+          check delivery-browser "$RESULT" "$DELIVERY_PASSED" "$DELIVERY_SKIPPED" 0
+          [ "$E2E_EXPECTED" = 435 ] && [ "$E2E_SKIPPED" = 30 ] || fail=1
+          [ "$DELIVERY_PASSED" = 42 ] && [ "$DELIVERY_SKIPPED" = 0 ] || fail=1
+          exit "$fail"
