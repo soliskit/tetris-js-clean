@@ -28,8 +28,3 @@ commit-msg:
       run:
         python3 "$(git rev-parse --git-path credit-guard/entry.py)" commit-msg
         {1}
-pre-push:
-  commands:
-    credit-objects:
-      use_stdin: true
-      run: python3 "$(git rev-parse --git-path credit-guard/entry.py)" pre-push
