@@ -1,0 +1,17 @@
+{
+  "hosted.py": "25b356fb7016dd6a4dda22592953e9ff411a602dad6a34915d252acb5f05620a",
+  "lifetime.py": "58b59786d9e0a8f18be3d3078611e519552ba4ae221def27f79f671fe48b6b37",
+  "log_transport.py": "9b4486812a3f56d091f5ea76ff71d481ca39c0d24e5bfc2737b2961e9a944a13",
+  "overlay/.credit-guard/install_local.py": "c355b6a54196707b74c5b13c4beec2b66a8990b8c18f5f681f7b4a8b39f74fbb",
+  "overlay/.credit-guard/prepush_admission.py": "1b4dd46b53393f49ac4390970586f0192f2358fc347525785fcb7f53c5cda9a9",
+  "overlay/.credit-guard/test_prepush_admission.py": "6cacfc87b22ba7a962063e23774ad0ab2c61184f94330aa0aa6e96c89223d99c",
+  "overlay/docs/local-credit-hooks.md": "b767c9683dde83e40b538b551ab8c3e6d16511026e411fbd69b2203705277843",
+  "overlay/lefthook.yml": "0fb5463dc55f8aed1351dccb24b38d9782f21d32a72a3144168b015812511b58",
+  "payload/base.bundle": "e58fa3b17205e39d605abffa89c7f1c6f30d22de89143c6a7d72a071d536891d",
+  "payload/expected-base.json": "d2a6963cf7fef9af5ec03e78ece65f314bbaca1cd0eec8ff0e28e411383540fe",
+  "payload/expected-candidate.json": "d631540f993ef867a483261d771d925fc9ce2a1087018b8227b2ae54b479146f",
+  "payload/runtime-sources.json": "64115b42c485c0abb1f269606bc0106d73c1818f585852c0556493cbf916386e",
+  "ruff-source.toml": "52a8901bf280f2e895e359aa5f42414d279ff539380206160f9ce9af3d22f640",
+  "run.py": "e5e1d72e5affbe6c6d90cc2284704775a4b15ff852f241d3f73cfdc1f6a1c72d",
+  "setup.py": "d27346ec720ab91fdeffad8ca6ea3a5cc24508bdd22223e105da2312f95c1f9a"
+}

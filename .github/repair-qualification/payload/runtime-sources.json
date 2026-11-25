@@ -1,0 +1,30 @@
+{
+  "python": {
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261124/cpython-3.13.18%2B20261124-aarch64-apple-darwin-install_only.tar.gz",
+    "sha256": "ae7030747b3daddea6925f4e270918c5d977f0347fe5d03adae94ce3a630ed74",
+    "size": 25656016
+  },
+  "npm": {
+    "url": "https://registry.npmjs.org/npm/-/npm-12.2.0.tgz",
+    "sha512": "ZsJjKpTnlmSXOLLXiU1xDCzC4Wlok4IwZmh/aw2KUuXytU7q6qMv/cUT7MoeSf95Slwuw/lRXYefGzGCspHPNQ==",
+    "sha256": "6666b48816b39b86c3febac7b51a4ee4de6c5ca589c382ad8004b6b113f86677"
+  },
+  "ruff": {
+    "url": "https://files.pythonhosted.org/packages/28/32/89a94a8eb11fd505a381ae6f04e190d038d9958695209dc1786ce5cfcda3/ruff-0.17.4-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "7ed2f416349944f908f9574215994602242b0836844eba48eec61473033afca0",
+    "size": 9432227
+  },
+  "PyYAML": {
+    "url": "https://files.pythonhosted.org/packages/b1/16/95309993f1d3748cd644e02e38b75d50cbc0d9561d21f390a76242ce073f/pyyaml-6.0.3-cp313-cp313-macosx_11_0_arm64.whl",
+    "sha256": "2283a07e2c21a2aa78d9c4442724ec1eb15f5e42a723b99cb3d822d48f5f7ad1",
+    "size": 173252
+  },
+  "node": {
+    "url": "https://nodejs.org/download/release/v26.13.0/node-v26.13.0-darwin-arm64.tar.gz",
+    "sha256": "d38bd5e5a2ddce6bbb5ce45e46e208337da4d51fffe611e567fd32073d6439f6"
+  },
+  "lefthook": {
+    "url": "https://github.com/evilmartians/lefthook/releases/download/v2.1.0/lefthook_2.1.0_MacOS_arm64",
+    "sha256": "4a2bded27339e7b521b72fe123cd343e8bba6b73fe92641f062c2644ca65a534"
+  }
+}

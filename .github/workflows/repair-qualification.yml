@@ -1,0 +1,34 @@
+name: TetrisJS full repair qualification
+"on":
+  push:
+    branches: [repair-qualification/tetrisjs-mac]
+permissions:
+  contents: read
+concurrency:
+  group: tetrisjs-full-repair-qualification
+  cancel-in-progress: false
+jobs:
+  qualify:
+    if: github.repository == 'soliskit/tetris-js-clean'
+    runs-on: macos-15
+    timeout-minutes: 360
+    steps:
+      - name: Start the total hosted envelope
+        shell: bash
+        run: echo "HOST_DEADLINE_UNIX=$(( $(date +%s) + 21600 ))" >> "$GITHUB_ENV"
+      - name: Fetch the exact test-only push without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require approved destination and source manifest
+        env:
+          EXPECTED_HEAD: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/repair-qualification/tetrisjs-mac
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$RUNNER_OS" = macOS
+          test "$RUNNER_ARCH" = ARM64
+          python3 -I .github/repair-qualification/hosted.py --output-parent "$RUNNER_TEMP"
