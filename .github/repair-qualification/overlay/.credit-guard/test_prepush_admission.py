@@ -771,5 +771,92 @@ class PlatformBindingTests(unittest.TestCase):
         self.assertEqual(len(pins), 3)
 
 
+class BuiltinAliasTests(unittest.TestCase):
+    def test_builtin_alias_binding_and_refusals(self):
+        spec = importlib.util.spec_from_file_location(
+            "alias_admission_fixture", ROOT / "prepush_admission.py"
+        )
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        rows = []
+        with tempfile.TemporaryDirectory(prefix="builtin-alias-fixtures-") as td:
+            root = Path(td).resolve()
+            canonical = root / "canonical-git"
+            canonical.write_bytes(b"fixture-git")
+            pin = hashlib.sha256(canonical.read_bytes()).hexdigest()
+            regular = root / "regular-alias"
+            os.link(canonical, regular)
+            correct = root / "symlink-alias"
+            correct.symlink_to(canonical)
+            other = root / "other-target"
+            other.write_bytes(canonical.read_bytes())
+            wrong = root / "wrong-alias"
+            wrong.symlink_to(other)
+            parent = root / "real-dir"
+            parent.mkdir()
+            (parent / "git").symlink_to(canonical)
+            linkdir = root / "linked-dir"
+            linkdir.symlink_to(parent, target_is_directory=True)
+            for name, path, accepted in (
+                ("regular-hardlink", regular, True),
+                ("canonical-symlink", correct, True),
+                ("parent-symlink-to-canonical", linkdir / "git", True),
+                ("same-bytes-different-target", wrong, False),
+            ):
+                try:
+                    m.verify_builtin_alias(str(path), str(canonical), pin)
+                    ok = True
+                except (ValueError, OSError):
+                    ok = False
+                assert ok == accepted
+                rows.append({"case": name, "accepted": ok})
+            canonical.write_bytes(b"changed")
+            try:
+                m.verify_builtin_alias(str(correct), str(canonical), pin)
+            except ValueError:
+                rows.append({"case": "changed-canonical-content", "accepted": False})
+            else:
+                raise AssertionError("changed Git accepted")
+            canonical.write_bytes(b"fixture-git")
+            # Verify old surrounding selector still refuses unknown spelling/wrong exec
+            # before the new helper is reached. Only Git's exact builtin alias is eligible.
+            manifest = {
+                "repo": str(root),
+                "git": str(canonical),
+                "pins": {str(canonical): pin},
+            }
+            old = Path.cwd()
+            os.chdir(root)
+            try:
+                for name, inherited, resolved in (
+                    ("wrong-exec-value", str(root / "wrong-exec"), str(correct)),
+                    ("arbitrary-path-alias", str(parent), str(correct)),
+                ):
+                    with (
+                        mock.patch.dict(
+                            os.environ, {"GIT_EXEC_PATH": inherited}, clear=True
+                        ),
+                        mock.patch.object(
+                            m.subprocess,
+                            "check_output",
+                            return_value=str(parent).encode(),
+                        ),
+                        mock.patch.object(m.shutil, "which", return_value=resolved),
+                        mock.patch.object(m, "verify_builtin_alias") as helper,
+                    ):
+                        try:
+                            m.admit(manifest)
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError(
+                                "selector unexpectedly admitted override"
+                            )
+                        helper.assert_not_called()
+                        rows.append({"case": name, "accepted": False})
+            finally:
+                os.chdir(old)
+
+
 if __name__ == "__main__":
     unittest.main()

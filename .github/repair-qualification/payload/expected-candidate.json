@@ -604,11 +604,11 @@
     "mode": 420
   },
   ".credit-guard/prepush_admission.py": {
-    "sha256": "1b4dd46b53393f49ac4390970586f0192f2358fc347525785fcb7f53c5cda9a9",
+    "sha256": "9777b1602fe5b650d19d0bc7ba8d9d106c5ab7310b8c2e4f0ba63621bd1cfeed",
     "mode": 420
   },
   ".credit-guard/test_prepush_admission.py": {
-    "sha256": "6cacfc87b22ba7a962063e23774ad0ab2c61184f94330aa0aa6e96c89223d99c",
+    "sha256": "8bacb18359ced81c0bdc1dbdc7e779e0381d9df80a398a267f926729717df232",
     "mode": 420
   },
   "docs/local-credit-hooks.md": {

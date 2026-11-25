@@ -69,6 +69,24 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def verify_builtin_alias(alias, git, expected_pin):
+    """Admit only the already selected Git's own builtin alias.
+
+    Linux may expose a regular hardlink. A symlink spelling is accepted only
+    when its canonical target is the independently admitted canonical Git.
+    All actual byte reads keep anchored nofollow traversal.
+    """
+    canonical = Path(alias).resolve(strict=True)
+    if str(canonical) != alias:
+        if str(canonical) != git:
+            raise ValueError("Git builtin alias target changed")
+        selected = git
+    else:
+        selected = alias
+    if digest(read_regular(selected, 64 * 1024 * 1024)) != expected_pin:
+        raise ValueError("Git builtin alias changed")
+
+
 def admit(manifest):
     repo = Path(manifest["repo"])
     for key in os.environ:
@@ -98,8 +116,7 @@ def admit(manifest):
         alias = str(Path(builtin_exec) / "git")
         if inherited_exec != builtin_exec or resolved != alias:
             raise ValueError("Git resolution changed")
-        if digest(read_regular(alias, 64 * 1024 * 1024)) != manifest["pins"][git]:
-            raise ValueError("Git builtin alias changed")
+        verify_builtin_alias(alias, git, manifest["pins"][git])
     custom = subprocess.run(
         [git, "config", "--get", "core.hooksPath"], capture_output=True, check=False
     )
