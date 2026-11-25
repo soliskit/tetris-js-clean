@@ -82,6 +82,75 @@ def extract_tar(archive, root):
                 destination.symlink_to(item.linkname)
 
 
+def select_native_git(owned, root, logs, env, report, save, prefix="git-select"):
+    """Resolve the image's developer Git before downloads, never adopt hook PATH."""
+    spec = importlib.util.spec_from_file_location(
+        "selection_admission",
+        Path(__file__).resolve().parent / "overlay/.credit-guard/prepush_admission.py",
+    )
+    admission = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(admission)
+    paths = {"shim": "/usr/bin/git", "resolver": "/usr/bin/xcrun"}
+    selected = {"paths": paths, "hashes": {}, "commands": []}
+    report["git_selection"] = selected
+
+    def pin(path):
+        value = Path(path)
+        if not value.is_absolute() or str(value.resolve(strict=True)) != path:
+            raise ValueError("native tool path not canonical")
+        if not os.access(value, os.X_OK):
+            raise ValueError("native tool not executable")
+        return hashlib.sha256(
+            admission.read_regular(path, 64 * 1024 * 1024)
+        ).hexdigest()
+
+    def command(label, argv):
+        result, error = owned.run(argv, root, env, logs, prefix + "-" + label, 30)
+        selected["commands"].append(result)
+        save()
+        if error is not None:
+            raise error
+        raw = (logs / (prefix + "-" + label) / "stdout.log").read_bytes()
+        if not 0 < len(raw) <= 8192 or b"\0" in raw:
+            raise ValueError("native selection output bound")
+        text = raw.decode().strip()
+        if "\n" in text or not text.startswith("/"):
+            raise ValueError("native selection requires single absolute path")
+        return text
+
+    for path in paths.values():
+        selected["hashes"][path] = pin(path)
+    save()
+    actual_spelling = command("resolve", [paths["resolver"], "--find", "git"])
+    paths["resolved_spelling"] = actual_spelling
+    paths["actual"] = str(Path(actual_spelling).resolve(strict=True))
+    save()
+    selected["hashes"][paths["actual"]] = pin(paths["actual"])
+    paths["shim_exec"] = command("shim-exec", [paths["shim"], "--exec-path"])
+    paths["actual_exec"] = command("actual-exec", [paths["actual"], "--exec-path"])
+    paths["alias"] = str(Path(paths["actual_exec"]) / "git")
+    paths["alias_target"] = str(Path(paths["alias"]).resolve(strict=True))
+    save()
+    if paths["shim_exec"] != paths["actual_exec"]:
+        raise ValueError("shim and selected native Git disagree")
+    if paths["alias_target"] != paths["actual"]:
+        raise ValueError("selected native Git builtin alias target differs")
+    admission.verify_builtin_alias(
+        paths["alias"], paths["actual"], selected["hashes"][paths["actual"]]
+    )
+    if (
+        command("resolve-recheck", [paths["resolver"], "--find", "git"])
+        != actual_spelling
+    ):
+        raise ValueError("native Git selection changed")
+    for path, expected in selected["hashes"].items():
+        if pin(path) != expected:
+            raise ValueError("native selection content changed")
+    selected["status"] = "BOUND"
+    save()
+    return selected
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-parent", required=True)
@@ -146,11 +215,6 @@ def main():
             raise ValueError("at least8GiB free space required")
         # Check existing native Git before expensive download work. Full real
         # local bundle, no network/original checkout/identity mutation.
-        git = Path("/usr/bin/git")
-        if git.resolve(strict=True) != git or not git.is_file():
-            raise ValueError("hosted Git path not canonical")
-        hosted_git_hash = digest(git)
-        report["hosted_git_sha256"] = hosted_git_hash
         report["hosted_image"] = {
             key: os.environ.get(key)
             for key in ("ImageOS", "ImageVersion", "RUNNER_OS", "RUNNER_ARCH")
@@ -172,6 +236,12 @@ def main():
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0",
         }
+        selection = select_native_git(owned, root, probe_logs, probe_env, report, save)
+        git = Path(selection["paths"]["actual"])
+        hosted_git_hash = selection["hashes"][str(git)]
+        probe_env["PATH"] = str(git.parent) + ":/usr/bin:/bin"
+        if shutil.which("git", path=probe_env["PATH"]) != str(git):
+            raise ValueError("selected native Git PATH mismatch")
         probes = [
             ("git-init", [str(git), "init", "-q", str(probe)]),
             (
@@ -343,7 +413,10 @@ def main():
             os.close(descriptor)
         env = {
             "HOME": str(home),
-            "PATH": str(bindir) + ":/usr/bin:/bin:/usr/sbin:/sbin",
+            "PATH": str(bindir)
+            + ":"
+            + str(git.parent)
+            + ":/usr/bin:/bin:/usr/sbin:/sbin",
             "LANG": "en_US.UTF-8",
             "CI": "1",
             "CREDIT_TEST_LEFTHOOK": str(lefthook),
@@ -354,15 +427,33 @@ def main():
             "npm_config_globalconfig": str(global_npmrc),
         }
         # Fresh GitHub-hosted image trust, same feature probes and run binding.
-        git = Path("/usr/bin/git")
+        final_selection = select_native_git(
+            owned, root, probe_logs, probe_env, report, save, "git-select-final"
+        )
+        if (
+            final_selection["paths"] != selection["paths"]
+            or final_selection["hashes"] != selection["hashes"]
+        ):
+            raise ValueError("native selection changed during setup")
         if git.resolve(strict=True) != git or digest(git) != hosted_git_hash:
             raise ValueError("hosted native Git changed during setup")
-        tools = [git, python, node, npm, npm_cli, bindir / "ruff", lefthook]
+        tools = [
+            Path("/usr/bin/git"),
+            Path("/usr/bin/xcrun"),
+            git,
+            python,
+            node,
+            npm,
+            npm_cli,
+            bindir / "ruff",
+            lefthook,
+        ]
         admission = {
             "platform": ["Darwin", "arm64"],
             "base": "97fad4864c11b9669cd80bd6d7e7e7998f314eaa",
             "python": str(python),
             "git": str(git),
+            "git_selection": final_selection,
             "node": str(node),
             "npm": str(npm),
             "ruff": str(bindir / "ruff"),

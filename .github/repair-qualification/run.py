@@ -99,8 +99,22 @@ def main():
     if str(Path(sys.executable).resolve()) != admission["python"]:
         raise ValueError("selected Python mismatch")
     git = admission["git"]
-    if git != "/usr/bin/git":
-        raise ValueError("frozen guard requires native /usr/bin/git")
+    selection = admission["git_selection"]
+    selected_paths = selection["paths"]
+    if (
+        selection["status"] != "BOUND"
+        or selected_paths["shim"] != "/usr/bin/git"
+        or selected_paths["resolver"] != "/usr/bin/xcrun"
+        or selected_paths["actual"] != git
+        or selected_paths["alias_target"] != git
+        or str(Path(selected_paths["alias"]).resolve(strict=True)) != git
+        or selected_paths["shim_exec"] != selected_paths["actual_exec"]
+        or any(
+            admission["tools"].get(path) != pin
+            for path, pin in selection["hashes"].items()
+        )
+    ):
+        raise ValueError("native Git selection binding changed")
     node, npm, ruff, lefthook = [
         admission[key] for key in ("node", "npm", "ruff", "lefthook")
     ]

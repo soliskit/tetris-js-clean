@@ -12,6 +12,6 @@
   "payload/expected-candidate.json": "4109b6ecdc6ae1f6388c1c771b629aab77a69f0bcc6cb434d8e9e3987deefa58",
   "payload/runtime-sources.json": "64115b42c485c0abb1f269606bc0106d73c1818f585852c0556493cbf916386e",
   "ruff-source.toml": "52a8901bf280f2e895e359aa5f42414d279ff539380206160f9ce9af3d22f640",
-  "run.py": "e5e1d72e5affbe6c6d90cc2284704775a4b15ff852f241d3f73cfdc1f6a1c72d",
-  "setup.py": "d27346ec720ab91fdeffad8ca6ea3a5cc24508bdd22223e105da2312f95c1f9a"
+  "run.py": "53cf01422715ecc3c4771b6e8a56fdc7bb1d66d8506fa07f5f9a82a6b43a3e8e",
+  "setup.py": "989ec32dd5cb52651bb1935a71968ec11d49c520a206961b564ba808347f93eb"
 }
