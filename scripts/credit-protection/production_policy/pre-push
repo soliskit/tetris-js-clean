@@ -1,0 +1,168 @@
+#!/bin/sh
+
+export LC_ALL=C
+
+[ -n "$EXPECTED_REMOTE_URL" ] || exit 1
+[ -n "$EXPECTED_REF" ] || exit 1
+[ -n "$APPROVED_OLD" ] || exit 1
+[ -n "$APPROVED_NEW" ] || exit 1
+
+remote_name="$1"
+remote_url="$2"
+
+if [ "$remote_url" != "$EXPECTED_REMOTE_URL" ]; then
+    echo "pre-push: remote URL is '$remote_url', expected '$EXPECTED_REMOTE_URL'" >&2
+    exit 1
+fi
+
+lines=0
+malformed=0
+while read -r local_ref local_sha remote_ref remote_sha extra; do
+    lines=$((lines + 1))
+    done_local_ref="$local_ref"; done_local_sha="$local_sha"
+    done_remote_ref="$remote_ref"; done_remote_sha="$remote_sha"
+    [ -n "$extra" ] && malformed=1
+done
+if [ "$lines" -ne 1 ]; then
+    echo "pre-push: expected exactly one ref update, got $lines" >&2
+    exit 1
+fi
+if [ "$malformed" -ne 0 ]; then
+    echo "pre-push: malformed stdin line (more than 4 fields)" >&2
+    exit 1
+fi
+
+if [ "$done_local_ref" != "$EXPECTED_REF" ] || [ "$done_remote_ref" != "$EXPECTED_REF" ]; then
+    echo "pre-push: ref is not the expected $EXPECTED_REF" >&2
+    exit 1
+fi
+if [ "$done_local_sha" != "$APPROVED_NEW" ]; then
+    echo "pre-push: pushed head is not the approved new head" >&2
+    exit 1
+fi
+case "$APPROVED_OLD" in
+    0000000000000000000000000000000000000000)
+        if [ "$done_remote_sha" != "0000000000000000000000000000000000000000" ]; then
+            echo "pre-push: ref already exists but approved as creation" >&2
+            exit 1
+        fi ;;
+    *)
+        if [ "$done_remote_sha" != "$APPROVED_OLD" ]; then
+            echo "pre-push: remote ref is not the approved predecessor" >&2
+            exit 1
+        fi ;;
+esac
+
+REQUIRED_NAME='David Solis'
+REQUIRED_EMAIL='doze.inept.0n@icloud.com'
+ZERO=0000000000000000000000000000000000000000
+
+walk=$(git rev-list "$done_local_sha" 2>/dev/null)
+if [ $? -ne 0 ]; then
+    echo "pre-push: cannot enumerate pushed commits ($done_local_sha)" >&2
+    exit 1
+fi
+if [ "$(printf '%s\n' "$walk" | wc -l)" -gt 10000 ]; then
+    echo "pre-push: full-history commit count cap" >&2
+    exit 1
+fi
+if [ -z "$walk" ]; then
+    echo "pre-push: empty ancestry walk ($done_local_sha)" >&2
+    exit 1
+fi
+if [ "$APPROVED_OLD" != "$ZERO" ]; then
+    contained=0
+    for s in $walk; do [ "$s" = "$APPROVED_OLD" ] && contained=1; done
+    if [ "$contained" -ne 1 ]; then
+        echo "pre-push: pushed head does not contain the approved predecessor" >&2
+        exit 1
+    fi
+fi
+
+for sha in $walk ; do
+    if ! raw=$(git cat-file commit "$sha" 2>/dev/null && printf 'x'); then
+        echo "pre-push: cannot read commit $sha" >&2
+        exit 1
+    fi
+    raw=${raw%x}
+
+    recomputed=$(printf '%s' "$raw" | git hash-object -t commit --stdin 2>/dev/null)
+    if [ $? -ne 0 ] || [ "$recomputed" != "$sha" ]; then
+        echo "pre-push: $sha raw bytes do not hash to its id" >&2
+        exit 1
+    fi
+
+    if ! printf '%s' "$raw" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+        echo "pre-push: $sha is not valid UTF-8" >&2
+        exit 1
+    fi
+
+    hdr=$(printf '%s' "$raw" | sed -n '1,/^$/p')
+    if ! printf '%s\n' "$hdr" | awk '
+        BEGIN { parents = 0; ok = 1 }
+        /^$/ { next }
+        /^ / { ok = 0; exit }
+        {
+            key = $1
+            order["tree"] = 1; order["parent"] = 2; order["author"] = 3; order["committer"] = 4
+            if (!(key in order)) { ok = 0; exit }
+            if (key == "parent") parents++
+            else if (seen[key]++) { ok = 0; exit }
+            if (order[key] < prev) { ok = 0; exit }
+            prev = order[key]
+            if (key == "tree" || key == "parent") {
+                if (NF != 2 || length($2) != 40 || $2 ~ /[^0-9a-f]/) ok = 0
+            } else {
+                if ($0 !~ / <[^<>]+> [0-9]+ [+-][0-9][0-9][0-9][0-9]$/) ok = 0
+            }
+        }
+        END { if (!ok || seen["tree"] != 1 || seen["author"] != 1 || seen["committer"] != 1) exit 1 }
+    '; then
+        echo "pre-push: $sha is not a canonical commit (headers/order/parents)" >&2
+        exit 1
+    fi
+
+    author_line=$(printf '%s\n' "$hdr" | sed -n 's/^author //p')
+    committer_line=$(printf '%s\n' "$hdr" | sed -n 's/^committer //p')
+    an=${author_line%% <*}; ae=${author_line#* <}; ae=${ae%%>*}
+    cn=${committer_line%% <*}; ce=${committer_line#* <}; ce=${ce%%>*}
+    if [ "$an" != "$REQUIRED_NAME" ] || [ "$ae" != "$REQUIRED_EMAIL" ] || \
+       [ "$cn" != "$REQUIRED_NAME" ] || [ "$ce" != "$REQUIRED_EMAIL" ]; then
+        echo "pre-push: $sha is not authored+committed by the required identity" >&2
+        exit 1
+    fi
+
+    msg=$(printf '%s' "$raw" | sed '1,/^$/d')
+    if [ $? -ne 0 ]; then
+        echo "pre-push: $sha message extraction failed" >&2
+        exit 1
+    fi
+    for section in Why How Tags; do
+        printf '%s' "$msg" | grep -q "^$section:"
+        grep_rc=$?
+        if [ "$grep_rc" -ne 0 ]; then
+            if [ "$grep_rc" -eq 1 ]; then
+                echo "pre-push: $sha is missing $section:" >&2
+            else
+                echo "pre-push: $sha section scan failed (grep rc $grep_rc); failing closed" >&2
+            fi
+            exit 1
+        fi
+        value=$(printf '%s' "$msg" | sed -n "s/^$section:[[:space:]]*//p" | sed -n '1p')
+        if [ -z "$value" ]; then
+            echo "pre-push: $sha has an empty $section: section" >&2
+            exit 1
+        fi
+    done
+    printf '%s' "$msg" | grep -Eqi \
+        '^co-authored-by[[:space:]]*:|^generated-with[[:space:]]*:|^assisted-by[[:space:]]*:|generated (with|by)\b|\[generated|\bby (claude|cursor|copilot|chatgpt|openai|anthropic|github copilot)\b|\b(claude|cursor|copilot|chatgpt)[ -]?(co-?authored|generated)\b|noreply@(anthropic|openai)\.|🤖'
+    grep_rc=$?
+    case "$grep_rc" in
+        1) ;;
+        0) echo "pre-push: $sha contains a prohibited credit" >&2
+           exit 1 ;;
+        *) echo "pre-push: $sha credit scan failed (grep rc $grep_rc); failing closed" >&2
+           exit 1 ;;
+    esac
+done
+exit 0
