@@ -7,6 +7,8 @@ export LC_ALL=C
 [ -n "$APPROVED_OLD" ] || exit 1
 [ -n "$APPROVED_NEW" ] || exit 1
 
+[ "$EXPECTED_REMOTE_URL" = "https://github.com/soliskit/tetris-js-clean.git" ] || exit 1
+
 remote_name="$1"
 remote_url="$2"
 
@@ -80,6 +82,17 @@ if [ "$APPROVED_OLD" != "$ZERO" ]; then
 fi
 
 for sha in $walk ; do
+    # Validate complete raw bytes before shell substitution can discard NUL bytes.
+    if ! git cat-file commit "$sha" | /usr/bin/python3 -c '
+import sys
+raw = sys.stdin.buffer.read()
+if not raw or b"\0" in raw or b"\r" in raw:
+    raise SystemExit(1)
+raw.decode("utf-8", "strict")
+'; then
+        echo "pre-push: $sha contains ambiguous raw bytes" >&2
+        exit 1
+    fi
     if ! raw=$(git cat-file commit "$sha" 2>/dev/null && printf 'x'); then
         echo "pre-push: cannot read commit $sha" >&2
         exit 1
@@ -137,23 +150,69 @@ for sha in $walk ; do
         echo "pre-push: $sha message extraction failed" >&2
         exit 1
     fi
-    for section in Why How Tags; do
-        printf '%s' "$msg" | grep -q "^$section:"
-        grep_rc=$?
-        if [ "$grep_rc" -ne 0 ]; then
-            if [ "$grep_rc" -eq 1 ]; then
-                echo "pre-push: $sha is missing $section:" >&2
-            else
-                echo "pre-push: $sha section scan failed (grep rc $grep_rc); failing closed" >&2
-            fi
-            exit 1
-        fi
-        value=$(printf '%s' "$msg" | sed -n "s/^$section:[[:space:]]*//p" | sed -n '1p')
-        if [ -z "$value" ]; then
-            echo "pre-push: $sha has an empty $section: section" >&2
-            exit 1
-        fi
-    done
+    if ! printf '%s' "$msg" | /usr/bin/python3 -c 'import re, sys
+ORDINARY = frozenset({"why", "how", "tags"})
+class StopForReview(ValueError):
+    pass
+def require(condition, reason):
+    if not condition: raise StopForReview(reason)
+def full_message(message):
+    require(
+        message.strip() and b"\0" not in message and b"\r" not in message,
+        "empty or ambiguous message",
+    )
+    try:
+        text = message.decode("utf-8", "strict")
+    except UnicodeError as error:
+        raise StopForReview("unqualified message encoding") from error
+    marker = r"(?:co[ -]?author(?:ed)?[ -]?by|claude[ -]?session|reviewed[ -]by|signed[ -]off[ -]by|acked[ -]by|tested[ -]by|assisted[ -]by|generated[ -]by)"
+    for original in text.splitlines():
+        line = original.strip().casefold()
+        for _ in range(20):
+            match = re.match(r"([a-z][a-z0-9 _-]{0,80})\s*:\s*(.*)$", line)
+            if not match or match[1].strip() not in ORDINARY:
+                break
+            line = match[2].strip()
+        else:
+            raise StopForReview("excessive nested fields")
+        require(
+            not re.search(r"(?:^|[\s;])" + marker + r"\b", line),
+            "credit marker requires review",
+        )
+        match = re.match(r"([a-z][a-z0-9 _-]{0,80})\s*[:=]", line)
+        require(not match, "unrecognized message field requires review")
+
+raw=sys.stdin.buffer.read()
+text=raw.decode("utf-8", "strict")
+if any(c in text for c in "\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"):
+    raise ValueError("ambiguous message line separator")
+full_message(raw)
+'; then
+        echo "pre-push: $sha failed project message parsing" >&2
+        exit 1
+    fi
+    case "$sha" in
+        0082abf8d4bf4ccc8c7c2769e6c3c429ff5a201a|2a09776a25d3fe4133d99925fa02d6e78d203e53|836e12b4e338c1fc2d40b9775db0f5d32bdd4620|918fbd801d6668c16e2f0f8c7c3751153469a0eb|97fad4864c11b9669cd80bd6d7e7e7998f314eaa|ef67197a710db37729ee1fbcf004e4346caad82c) ;;
+        *)
+            if ! printf '%s\n' "$msg" | awk '
+                /^Why:/ || /^How:/ || /^Tags:/ {
+                    tag = $0; sub(/:.*/, "", tag)
+                    if (seen[tag]++) bad = 1
+                    current = tag
+                    value = $0; sub(/^[^:]*:/, "", value)
+                    if (value ~ /[^[:space:]]/) content[current] = 1
+                    next
+                }
+                { if (current != "" && $0 ~ /[^[:space:]]/) content[current] = 1 }
+                END { for (i = 1; i <= 3; i++) {
+                    tag = (i == 1 ? "Why" : i == 2 ? "How" : "Tags")
+                    if (seen[tag] != 1 || !content[tag]) bad = 1
+                }; if (bad) exit 1 }
+            '; then
+                echo "pre-push: $sha missing, repeated or empty message section" >&2
+                exit 1
+            fi ;;
+    esac
     printf '%s' "$msg" | grep -Eqi \
         '^co-authored-by[[:space:]]*:|^generated-with[[:space:]]*:|^assisted-by[[:space:]]*:|generated (with|by)\b|\[generated|\bby (claude|cursor|copilot|chatgpt|openai|anthropic|github copilot)\b|\b(claude|cursor|copilot|chatgpt)[ -]?(co-?authored|generated)\b|noreply@(anthropic|openai)\.|🤖'
     grep_rc=$?
