@@ -46,6 +46,12 @@ def prepare(binding, checkout):
 
     from production_policy import issuer
 
+    if (
+        binding["repo"] != issuer.policy.TARGET_REPOSITORY
+        or binding["repo_id"] != issuer.policy.TARGET_REPOSITORY_ID
+    ):
+        raise ValueError("repository differs from reviewed format boundary")
+
     env = {
         "PATH": "/usr/bin:/bin",
         "HOME": checkout,
